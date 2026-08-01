@@ -1,0 +1,41 @@
+name: EchoGuard CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  upper-computer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: upper_computer/requirements.txt
+      - name: Install runtime dependencies
+        run: python -m pip install -r upper_computer/requirements.txt
+      - name: Compile Python sources
+        run: python -m compileall -q upper_computer
+      - name: Run unit tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
+  firmware:
+    runs-on: ubuntu-latest
+    container: espressif/idf:v5.2.6
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [gateway, node]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build ESP32-S3 firmware
+        shell: bash
+        run: |
+          cd "firmware/${{ matrix.target }}"
+          idf.py build

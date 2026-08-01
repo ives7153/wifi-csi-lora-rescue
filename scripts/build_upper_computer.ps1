@@ -12,4 +12,5 @@ if ($LASTEXITCODE -ne 0) {
 
 python -m PyInstaller --clean --noconfirm EchoGuard.spec
 
-Write-Host "EchoGuard build complete: dist\EchoGuard\EchoGuard.exe"
+$distName = python -c "from upper_computer.version import STANDARD_DIST_NAME; print(STANDARD_DIST_NAME)"
+Write-Host "EchoGuard build complete: dist\$distName\EchoGuard.exe"

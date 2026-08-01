@@ -9,4 +9,8 @@ idf_component_register(
         driver
         esp_adc
         esp_timer
+        echoguard_protocol
+        echoguard_lora
+        sensors
+        wifi_manager
 )

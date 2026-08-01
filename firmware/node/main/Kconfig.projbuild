@@ -8,4 +8,18 @@ menu "Rescue Node Configuration"
             Unique node ID sent in the LoRa payload and Gateway JSON frame.
             Set a different ID before flashing each physical rescue node.
 
+    config ECHOGUARD_PRIMARY_SSID
+        string "Primary Gateway SSID"
+        default "EchoGuard-GW-01"
+
+    config ECHOGUARD_SECONDARY_SSID
+        string "Secondary Gateway SSID"
+        default "EchoGuard-GW-02"
+
+    config ECHOGUARD_WIFI_PASSWORD
+        string "Gateway WPA2 password"
+        default "511511511"
+        help
+            Shared password for the primary and secondary Gateway SoftAPs.
+
 endmenu

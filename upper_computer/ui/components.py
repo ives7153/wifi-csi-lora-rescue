@@ -36,6 +36,7 @@ try:
         HEALTH_CRITICAL,
         HEALTH_INACTIVE,
         NODE_LABELS,
+        PRESENCE_THRESHOLD,
         THEME,
         TOPOLOGY_NODE_POSITIONS,
     )
@@ -49,6 +50,7 @@ except ImportError:
         HEALTH_CRITICAL,
         HEALTH_INACTIVE,
         NODE_LABELS,
+        PRESENCE_THRESHOLD,
         THEME,
         TOPOLOGY_NODE_POSITIONS,
     )
@@ -410,6 +412,7 @@ class TopologyWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.nodes: dict[int, dict[str, Any]] = {}
+        self.presence_threshold = PRESENCE_THRESHOLD
         self.setMinimumHeight(220)
         self._anim_started_at = time.time()
         self._timer = QTimer(self)
@@ -417,8 +420,13 @@ class TopologyWidget(QWidget):
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
-    def set_nodes(self, nodes: dict[int, dict[str, Any]]) -> None:
+    def set_nodes(
+        self,
+        nodes: dict[int, dict[str, Any]],
+        presence_threshold: float = PRESENCE_THRESHOLD,
+    ) -> None:
         self.nodes = nodes
+        self.presence_threshold = max(0.0, min(float(presence_threshold), 1.0))
         if self.isVisible():
             self.update()
 
@@ -560,8 +568,7 @@ class TopologyWidget(QWidget):
         return _rssi_color(_float(state.get("rssi")), True)
 
     def _is_active_node(self, state: dict[str, Any]) -> bool:
-        motion = _score(state.get("motion_score"))
-        return life_motion_triggered(state) or motion >= 0.65
+        return life_motion_triggered(state, presence_threshold=self.presence_threshold)
 
 
 # ---------------------------------------------------------------------------

@@ -15,7 +15,7 @@ EchoGuard 由三部分组成：
 
 - **Rescue Node 感知节点**：ESP32-S3 采集 WiFi CSI、AHT20 温湿度、姿态和 MQ-135 气体原始值，并通过 Ra-02/SX1278 LoRa 模块上报。
 - **Gateway 汇聚网关**：ESP32-S3 接收 LoRa 帧，将节点数据转换为 JSON Lines，经 USB Serial/JTAG 输出给上位机。
-- **EchoGuard 上位机**：PyQt6 桌面程序，负责串口接收、节点自动发现、实时曲线、事件流、历史导出、规则报警和 AI 辅助解释。
+- **EchoGuard 上位机**：PyQt6 桌面程序，负责串口接收、节点自动发现、实时曲线、事件流、历史导出、规则报警、AI 辅助解释和现场问答。
 
 本项目强调“真实数据链路优先”：未收到 Gateway 串口帧前，上位机不生成假节点、不伪造历史样本；实时结论由规则融合输出，AI 只做异步辅助解释。
 
@@ -24,12 +24,14 @@ EchoGuard 由三部分组成：
 - WiFi CSI 生命微动感知：基于 ESP32-S3 WiFi CSI 滑动窗口提取幅度扰动特征。
 - LoRa 远距离回传：节点与 Gateway 使用 433 MHz、BW125、SF7、CR4/5 的 SX1278 链路。
 - 多节点自动发现：上位机根据 Gateway JSON 中的 `id` 自动创建 `node{id}`。
-- 多节点综合研判：最近 5 秒窗口内融合 presence、motion、confidence 和 RSSI。
+- 存在感知硬阈值：节点 presence 低于用户设置值判为无人，达到或高于设置值判为疑似微动；confidence 与 CSI quality 仅用于诊断展示。
+- 多节点综合研判：最近 5 秒窗口内按统一存在阈值统计触发节点，并保留 motion、confidence 和 RSSI 作为辅助上下文。
 - 现场安全提示：LoRa 天线、电源共地、MQ-135 分压、I2C 上拉等硬件注意事项文档化。
-- MQ-135 CO2 估算 ppm：上位机将节点上报的 ADC 原始值按分压、电阻和 R0 标定参数换算为估算 ppm，支持清洁空气一键校准。
-- 数据导出能力：支持 CSV 导出、融合扰动曲线截图和整窗截图。
-- AI 辅助研判：本地 Jina GGUF embedding 与可选大模型 API，仅用于解释和辅助，不接管实时判断。
-- Windows 打包：提供 PyInstaller spec 与一键打包脚本，生成 `dist/EchoGuard/EchoGuard.exe`。
+- MQ-135 CO2 估算 ppm：上位机将节点上报的 ADC 原始值按分压、电阻和 R0 标定参数换算为估算 ppm，支持按节点 R0 校准和全部在线节点校准。
+- 数据导出能力：支持 CSV 导出、融合扰动曲线截图和整窗截图，导出/截图结果通过右上角 toast 弹窗提示。
+- AI 辅助研判与问答：仪表盘显示短摘要，`AI 辅助` 页提供结构化研判、右侧上下文栏和 Markdown 对话；本地 Jina GGUF embedding 用于向量检索，可选大模型 API 用于联网生成回答，AI 不接管实时判断。
+- 数据录制回放：保留原始 Gateway JSON Lines 和接收时间，回放数据明确标记来源，不与实时数据混淆。
+- 双发行版：普通监测版与无密码手机演示控制版共用 v0.3.3 核心代码和 PyInstaller 打包流程。
 
 ## 系统架构
 
@@ -45,7 +47,7 @@ Gateway
         | USB Serial/JTAG JSON Lines @ 115200
         v
 EchoGuard Upper Computer
-  PyQt6 UI + parser + rule fusion + export + AI helper
+  PyQt6 UI + parser + rule fusion + export + AI helper/chat
 ```
 
 ## 数据协议
@@ -81,6 +83,8 @@ Gateway 输出一行 JSON：
   "ts": 12345
 }
 ```
+
+Gateway 每 10 秒还会输出 `type=gateway_status` 状态行，包含固件版本、SSID、LoRa 正确接收数、CRC 错误数、异常长度、队列丢包和 Wi-Fi 客户端数量。状态行仅用于技术诊断，不会创建节点。
 
 上位机将字段规范化为 `node_id`、`presence_score`、`motion_score`、`confidence`、`gas_raw`、`gas_ppm`、`temperature`、`humidity`、`rssi` 等内部字段，其中 `gas` 兼容字段等同于 CO2 估算 ppm。详见 [docs/interface_alignment.md](docs/interface_alignment.md)。
 
@@ -170,6 +174,8 @@ python main.py
 
 上位机启动后会自动刷新串口列表。连接 Gateway 后，收到有效 JSON Lines 时会自动发现节点并刷新仪表盘、节点管理、数据分析、历史记录和技术诊断页面。
 
+左侧提供原始会话录制与回放入口。历史记录和 CSV 使用 `serial_real`、`mobile_override`、`demo_mode`、`replay` 区分真实串口、手机覆盖、本地演示和文件回放。
+
 ## 打包 Windows 程序
 
 安装打包依赖：
@@ -184,22 +190,37 @@ python -m pip install -r requirements-build.txt
 powershell -ExecutionPolicy Bypass -File scripts\build_upper_computer.ps1
 ```
 
+同时构建普通版和 Mobile 版并生成 SHA-256：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package_releases.ps1
+```
+
 打包产物：
 
 ```text
 dist/
-+-- EchoGuard/
++-- EchoGuard-v0.3.3-windows/
+|   +-- EchoGuard.exe
++-- EchoGuard-Mobile-v0.3.3-windows/
     +-- EchoGuard.exe
 ```
 
 详细说明见 [docs/upper_computer_packaging.md](docs/upper_computer_packaging.md)。
 
-## AI 辅助研判
+## AI 辅助
 
-AI 模块默认以规则回退为主，不影响实时判断。可选能力包括：
+AI 模块默认以规则回退为主，不影响实时判断。v0.3.1 起，上位机提供三层 AI 参与方式：
 
-- 本地 Jina GGUF embedding：用于对规则融合摘要做模式相似度匹配。
-- 可选大模型 API：用于生成更自然的解释文本。
+- 仪表盘短摘要：综合研判卡片只显示稳定、简短的 AI 辅助摘要。
+- AI 辅助页：展示依据、风险、趋势、建议、节点贡献和最近 AI 研判历史。
+- AI 对话工作台：支持现场问答，回答区采用 Markdown 显示，右侧上下文栏常驻并可滚动。
+
+可选能力包括：
+
+- 本地 Jina GGUF embedding：用于对规则融合摘要和本地知识片段做向量检索，不作为生成式聊天模型。
+- 可选大模型 API：用于联网生成更自然的解释、建议和问答回复。
+- 规则回退：无 Jina、无 API 或网络不可用时，仍使用本地规则模板生成谨慎建议。
 - 离线包导入：适合比赛、答辩和无网现场。
 
 模型和 llama.cpp runtime 不提交到仓库，默认放在：
@@ -210,6 +231,8 @@ upper_computer/runtime/
 ```
 
 这两个目录已由 `.gitignore` 排除。部署说明见 [docs/local_jina_deployment.md](docs/local_jina_deployment.md)。
+
+AI 只解释“疑似、风险、依据、建议”，不会确认生命存在，不会修改报警规则，也不会上传原始 CSI 曲线或改变 Gateway/Node 协议。
 
 ## 文档索引
 
@@ -238,4 +261,5 @@ upper_computer/runtime/
 - MQ-135 的 AO 进入 ESP32-S3 ADC 前必须确认不超过 3.3V。
 - 当前 `gas` 在 Gateway JSON 中仍是 MQ-135 ADC 原始值；上位机显示的 `gas_ppm` / 兼容 `gas` 为 CO2 估算 ppm，需通过清洁空气校准提升可信度。
 - 当前节点固件不上传电池电量，上位机显示为“未上报”。
-- `upper_computer/models/`、`upper_computer/runtime/`、`upper_computer/exports/` 和 `dist/` 不应提交到 GitHub。
+- `upper_computer/models/`、`upper_computer/runtime/` 和 `upper_computer/exports/` 不应提交到 GitHub。
+- `dist/` 与 `releases/` 为本地打包 / 发布产物目录，不应提交到 GitHub；正式分发优先使用 GitHub Releases 上传 `EchoGuard-vX.Y.Z-windows.zip`。

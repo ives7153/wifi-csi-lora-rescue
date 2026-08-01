@@ -37,6 +37,8 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
         "valid": False,
         "raw": raw,
         "error": "",
+        "frame_type": "node_data",
+        "gateway_status": None,
         "node_id": None,
         "seq": None,
         "presence_score": 0.0,
@@ -70,6 +72,17 @@ def parse_gateway_frame(line: str) -> dict[str, Any]:
 
     if not isinstance(payload, dict):
         result["error"] = "JSON 顶层不是对象"
+        return result
+
+    if str(payload.get("type") or "").strip().lower() == "gateway_status":
+        result.update(
+            {
+                "valid": True,
+                "frame_type": "gateway_status",
+                "gateway_status": dict(payload),
+                "source_ts_ms": _optional_int(_first(payload, "uptime_ms", "ts")),
+            }
+        )
         return result
 
     node_id = _first(payload, "id", "node_id")

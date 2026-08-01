@@ -9,12 +9,12 @@ from __future__ import annotations
 from typing import Any, overload
 
 try:
-    from ..config import CONFIDENCE_THRESHOLD, GAS_ALARM_PPM, OFFLINE_SECONDS, PRESENCE_THRESHOLD
+    from ..config import GAS_ALARM_PPM, OFFLINE_SECONDS, PRESENCE_THRESHOLD
     from .detection_fusion import life_motion_triggered
 except ImportError:
     if __package__ and __package__.startswith("upper_computer"):
         raise
-    from config import CONFIDENCE_THRESHOLD, GAS_ALARM_PPM, OFFLINE_SECONDS, PRESENCE_THRESHOLD  # type: ignore
+    from config import GAS_ALARM_PPM, OFFLINE_SECONDS, PRESENCE_THRESHOLD  # type: ignore
     from rules.detection_fusion import life_motion_triggered  # type: ignore
 
 DEDUP_SECONDS = 5.0
@@ -69,7 +69,6 @@ def evaluate_sample(
         if node_id > 0 and life_motion_triggered(
             sample,
             presence_threshold=PRESENCE_THRESHOLD,
-            confidence_threshold=CONFIDENCE_THRESHOLD,
         ):
             _append_alarm(dict_events, text_events, now, node_id, "life_motion", "疑似生命微动")
         if node_id > 0 and gas > GAS_THRESHOLD:

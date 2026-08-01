@@ -34,22 +34,24 @@ class CsiQualityRulesTest(unittest.TestCase):
         for field in ("csi_quality", "csi_sample_count", "breath_lock", "noise_floor"):
             self.assertIn(field, CSV_FIELDS)
 
-    def test_low_quality_high_presence_does_not_trigger(self) -> None:
+    def test_low_quality_low_confidence_high_presence_still_triggers(self) -> None:
         sample = {
             "node_id": 1,
             "presence_score": 0.92,
             "motion_score": 0.2,
-            "confidence": 0.94,
+            "confidence": 0.10,
             "csi_quality": 0.2,
             "timestamp": 10.0,
         }
 
-        self.assertFalse(life_motion_triggered(sample))
+        self.assertTrue(life_motion_triggered(sample))
         summary = build_detection_summary({1: sample}, [sample], reference_ts=10.0)
-        self.assertEqual(summary.status, "数据不足")
+        self.assertEqual(summary.status, "疑似局部微动")
 
         engine = AlarmEngine()
-        self.assertEqual(engine.evaluate(sample, now=10.0), [])
+        alarms = engine.evaluate(sample, now=10.0)
+        self.assertEqual(len(alarms), 1)
+        self.assertEqual(alarms[0]["kind"], "life_motion")
 
     def test_two_high_quality_nodes_trigger_multi_node_summary(self) -> None:
         history = [

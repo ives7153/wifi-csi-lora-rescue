@@ -4,20 +4,26 @@
 不直接解析 JSON、不直接跑报警规则，只接收这里发出的 Qt 信号并刷新控件。
 这样串口后台读取不会阻塞主线程，同时保持 serial_handler.py / data_parser.py 的兼容性。
 
-本层只驱动真实串口数据：收到 Gateway JSON 后按节点 id 自动创建节点状态与矩阵行；
-未收到真实数据前不预置节点、不注入演示样本。
+默认运行时只驱动真实串口数据：收到 Gateway JSON 后按节点 id 自动创建节点状态与矩阵行。
+控制版入口会额外启用面板驱动的样本注入，但仍复用同一条状态、历史和规则链路。
 """
 
 from __future__ import annotations
 
+import math
 import time
 import threading
 from collections import deque
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 from typing import Any
 
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QWidget
+
+
+MOBILE_CONTROL_NODE_IDS = frozenset((1, 2, 3))
+
 
 try:
     from ..config import (
@@ -29,6 +35,7 @@ try:
         DEFAULT_MESH_ENABLED,
         GAS_THRESHOLD_PPM,
         GATEWAY_ID,
+        EXPORT_DIR,
         HEALTH_CRITICAL,
         HEALTH_EXCELLENT,
         HEALTH_GOOD,
@@ -65,7 +72,8 @@ try:
         wait_for_embedding_ready,
     )
     from ..rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered
-    from ..serial_handler import SerialReader
+    from ..serial_handler import SerialReader, open_serial_port
+    from ..recording import GatewayRecorder, RecordedLine, load_recording
     from .alarm_rules import AlarmEngine
     from ..gas_calibration import (
         DEFAULT_MQ135_R0_KOHM,
@@ -90,6 +98,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         DEFAULT_MESH_ENABLED,
         GAS_THRESHOLD_PPM,
         GATEWAY_ID,
+        EXPORT_DIR,
         HEALTH_CRITICAL,
         HEALTH_EXCELLENT,
         HEALTH_GOOD,
@@ -126,7 +135,8 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         wait_for_embedding_ready,
     )
     from rules.detection_fusion import ai_fallback_text, build_detection_summary, life_motion_triggered  # type: ignore
-    from serial_handler import SerialReader
+    from serial_handler import SerialReader, open_serial_port
+    from recording import GatewayRecorder, RecordedLine, load_recording
     from core.alarm_rules import AlarmEngine
     from gas_calibration import (
         DEFAULT_MQ135_R0_KOHM,
@@ -172,7 +182,7 @@ class NodeState:
     gas_ppm: float = 0.0
     temperature: float = 0.0
     humidity: float = 0.0
-    source: str = "serial"
+    source: str = "serial_real"
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -196,6 +206,16 @@ class MatrixNodeState:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class ControlNodeState:
+    """控制版上位机的节点注入状态。"""
+
+    node_id: int
+    enabled: bool = False
+    csi_value: int = 0
+    seq: int = 0
 
 
 @dataclass(slots=True)
@@ -313,7 +333,7 @@ class SerialWorker(QObject):
             parsed = parse_gateway_frame(line)
             if parsed.get("valid"):
                 parsed["timestamp"] = time.time()
-                parsed["source"] = "serial"
+                parsed["source"] = "serial_real"
                 frames.append(parsed)
                 last_raw = str(parsed.get("raw", line))
             else:
@@ -327,13 +347,14 @@ class SerialWorker(QObject):
             "dropped": dropped,
             "pending": pending,
             "last_raw": last_raw,
+            "raw_lines": lines,
         }
         if frames or invalid or dropped:
             self.frames_received.emit(frames, stats)
 
 
 class DataManager(QObject):
-    """应用数据中心：串口、Demo、规则、历史、节点矩阵和导出。"""
+    """应用数据中心：串口、规则、历史、节点矩阵、控制样本和导出。"""
 
     snapshot_changed = pyqtSignal(object)
     status_changed = pyqtSignal(str, bool)
@@ -343,6 +364,7 @@ class DataManager(QObject):
     ai_operation_message_changed = pyqtSignal(str, bool)
     ai_operation_result_changed = pyqtSignal(object)
     ai_models_changed = pyqtSignal(object)
+    recording_state_changed = pyqtSignal(bool, str)
     _ai_analysis_ready = pyqtSignal(int, object)
     _ai_chat_ready = pyqtSignal(int, object)
     _ai_operation_ready = pyqtSignal(str, bool)
@@ -354,6 +376,7 @@ class DataManager(QObject):
 
         self.started_at = time.time()
         self.available_ports: list[str] = []
+        self._preferred_gateway_ports: list[str] = []
         self.selected_port = ""
         self.history: list[dict[str, Any]] = []
         self.events: list[EventRecord] = []
@@ -425,7 +448,9 @@ class DataManager(QObject):
             "total_valid": 0,
             "total_invalid": 0,
             "total_dropped": 0,
+            "total_gateway_status": 0,
         }
+        self._gateway_status: dict[str, Any] = {}
         self._dirty = True
         self._active_node = 0
         self._paused = False
@@ -435,6 +460,18 @@ class DataManager(QObject):
         self._breath_lock_flags: dict[int, bool] = {}
         self._offline_flags: dict[int, bool] = {}
         self._gas_alert_flags: dict[int, bool] = {}
+        self._control_nodes: dict[int, ControlNodeState] = {}
+        self._control_started_at = time.time()
+        self._mobile_presence_overrides: dict[int, float] = {}
+        self._last_real_samples: dict[int, dict[str, Any]] = {}
+        self._recorder = GatewayRecorder()
+        self._replay_records: list[RecordedLine] = []
+        self._replay_index = 0
+        self._replay_started_at = 0.0
+        self._replay_base_time = 0.0
+        self._replay_invalid_rows = 0
+        self._replay_invalid_frames = 0
+        self._replay_path: Path | None = None
 
         self._ui_timer = QTimer(self)
         self._ui_timer.setInterval(UI_REFRESH_MS)
@@ -451,6 +488,14 @@ class DataManager(QObject):
         self._ai_timer = QTimer(self)
         self._ai_timer.setInterval(1000)
         self._ai_timer.timeout.connect(self._maybe_schedule_ai_analysis)
+
+        self._control_timer = QTimer(self)
+        self._control_timer.setInterval(1000)
+        self._control_timer.timeout.connect(self._inject_control_samples)
+
+        self._replay_timer = QTimer(self)
+        self._replay_timer.setInterval(25)
+        self._replay_timer.timeout.connect(self._replay_tick)
 
         self._ai_analysis_ready.connect(self._handle_ai_analysis_ready)
         self._ai_chat_ready.connect(self._handle_ai_chat_ready)
@@ -476,6 +521,10 @@ class DataManager(QObject):
         self._offline_timer.stop()
         self._auto_timer.stop()
         self._ai_timer.stop()
+        self._control_timer.stop()
+        self._replay_timer.stop()
+        self._replay_records.clear()
+        self._recorder.stop()
         self.stop_serial()
         self.ai_runtime.stop()
 
@@ -487,9 +536,17 @@ class DataManager(QObject):
         try:
             import serial.tools.list_ports as list_ports
 
-            self.available_ports = [port.device for port in list_ports.comports()]
+            port_infos = list(list_ports.comports())
+            self.available_ports = [port.device for port in port_infos]
+            self._preferred_gateway_ports = [
+                port.device
+                for port in port_infos
+                if (port.vid, port.pid) == (0x1A86, 0x7523)
+                or "CH340" in str(port.description or "").upper()
+            ]
         except Exception:  # noqa: BLE001 - pyserial 缺失或枚举失败时仍可演示。
             self.available_ports = []
+            self._preferred_gateway_ports = []
 
         selected = self.selected_port if self.selected_port in self.available_ports else ""
         self.ports_changed.emit(self.available_ports, selected)
@@ -510,6 +567,191 @@ class DataManager(QObject):
 
         self.stop_serial()
         self.status_changed.emit("串口状态：已手动断开，等待连接", False)
+
+    @pyqtSlot(int, bool, int)
+    def set_control_node(self, node_id: int, enabled: bool, csi_value: int) -> None:
+        """控制版：设置某个节点是否由控制面板注入 CSI 0/1 样本。"""
+
+        node_id = int(node_id)
+        if node_id <= 0:
+            return
+        state = self._control_nodes.get(node_id)
+        if state is None:
+            state = ControlNodeState(node_id=node_id)
+            self._control_nodes[node_id] = state
+        state.enabled = bool(enabled)
+        state.csi_value = 1 if int(csi_value) else 0
+        self._sync_control_timer()
+        self._inject_control_samples()
+
+    @pyqtSlot(str)
+    def apply_control_scene(self, scene_name: str) -> None:
+        """控制版：应用预设场景。"""
+
+        normalized = str(scene_name or "").strip().lower()
+        if normalized in {"all_zero", "clear_signal"}:
+            targets = {node_id: 0 for node_id in NODE_LABELS}
+        elif normalized in {"single_node", "node3"}:
+            targets = {node_id: (1 if node_id == 3 else 0) for node_id in NODE_LABELS}
+        elif normalized in {"multi_node", "multi"}:
+            targets = {node_id: (1 if node_id in {1, 2} else 0) for node_id in NODE_LABELS}
+        elif normalized in {"clear", "off", "restore"}:
+            self.clear_control_nodes()
+            return
+        else:
+            return
+
+        for node_id, csi_value in targets.items():
+            state = self._control_nodes.get(node_id)
+            if state is None:
+                state = ControlNodeState(node_id=node_id)
+                self._control_nodes[node_id] = state
+            state.enabled = True
+            state.csi_value = int(csi_value)
+        self._sync_control_timer()
+        self._inject_control_samples()
+
+    @pyqtSlot()
+    def clear_control_nodes(self) -> None:
+        """控制版：关闭所有节点控制，恢复真实串口优先。"""
+
+        for state in self._control_nodes.values():
+            state.enabled = False
+        self._sync_control_timer()
+        self._dirty = True
+
+    @pyqtSlot(int, float)
+    def set_mobile_presence(self, node_id: int, value: float) -> None:
+        """手机控制版：立即覆盖指定节点的存在感知值。"""
+
+        node_id = int(node_id)
+        value = float(value)
+        if node_id not in MOBILE_CONTROL_NODE_IDS or not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            return
+
+        self._mobile_presence_overrides[node_id] = value
+        self._apply_sample(
+            self._build_mobile_presence_sample(node_id, value),
+            run_rules=True,
+            mark_dirty=True,
+        )
+
+    @pyqtSlot(int)
+    def clear_mobile_presence(self, node_id: int) -> None:
+        """手机控制版：取消单个节点的存在感知覆盖。"""
+
+        node_id = int(node_id)
+        self._mobile_presence_overrides.pop(node_id, None)
+        self._restore_real_node(node_id)
+        self._dirty = True
+
+    @pyqtSlot()
+    def clear_all_mobile_presence(self) -> None:
+        """手机控制版：取消全部节点的存在感知覆盖。"""
+
+        node_ids = set(self._mobile_presence_overrides)
+        self._mobile_presence_overrides.clear()
+        for node_id in node_ids:
+            self._restore_real_node(node_id)
+        self._dirty = True
+
+    def _restore_real_node(self, node_id: int) -> None:
+        sample = self._last_real_samples.get(int(node_id))
+        if sample is not None:
+            restored = dict(sample)
+            restored["timestamp"] = time.time()
+            restored["source"] = "serial_real"
+            self._apply_sample(restored, run_rules=True, mark_dirty=False)
+            return
+        node = self.nodes.get(int(node_id))
+        if node is not None:
+            node.online = False
+            node.last_received = None
+            node.presence_score = 0.0
+            node.motion_score = 0.0
+            node.source = "serial_real"
+
+    @pyqtSlot(bool)
+    def set_recording_enabled(self, enabled: bool) -> None:
+        """Start or stop lossless Gateway line recording."""
+
+        if not enabled:
+            path = self._recorder.stop()
+            message = f"录制已保存：{path.name}" if path is not None else "录制未启动"
+            self.recording_state_changed.emit(False, message)
+            if path is not None:
+                self._append_event("RECORDING SAVED", str(path), level="OK", kind="recording")
+            return
+
+        if self._recorder.active:
+            self.recording_state_changed.emit(True, f"正在录制：{self._recorder.path.name}")
+            return
+        target = EXPORT_DIR / "recordings" / f"echoguard_session_{time.strftime('%Y%m%d_%H%M%S')}.jsonl"
+        try:
+            path = self._recorder.start(target)
+        except Exception as exc:  # noqa: BLE001
+            self.recording_state_changed.emit(False, f"录制启动失败：{exc}")
+            return
+        self.recording_state_changed.emit(True, f"正在录制：{path.name}")
+        self._append_event("RECORDING STARTED", str(path), level="OK", kind="recording")
+
+    @pyqtSlot(str)
+    def replay_recording(self, path_text: str) -> None:
+        """Replay a recorded Gateway session through the normal data pipeline."""
+
+        if self._serial_connected:
+            self.status_changed.emit("回放前请先断开真实 Gateway 串口，避免数据混合", False)
+            return
+        path = Path(path_text)
+        try:
+            records, invalid = load_recording(path)
+        except Exception as exc:  # noqa: BLE001
+            self.status_changed.emit(f"回放文件读取失败：{exc}", False)
+            return
+        if not records:
+            self.status_changed.emit("回放文件中没有可用 Gateway 记录", False)
+            return
+        self._replay_records = records
+        self._replay_index = 0
+        self._replay_started_at = time.monotonic()
+        self._replay_base_time = records[0].recorded_at
+        self._replay_invalid_rows = invalid
+        self._replay_invalid_frames = 0
+        self._replay_path = path
+        self._replay_timer.start()
+        self.status_changed.emit(f"正在回放：{path.name}", True)
+        self._append_event("REPLAY STARTED", path.name, level="INFO", kind="replay")
+
+    def _replay_tick(self) -> None:
+        if not self._replay_records:
+            self._replay_timer.stop()
+            return
+        elapsed = time.monotonic() - self._replay_started_at
+        applied = False
+        while self._replay_index < len(self._replay_records):
+            record = self._replay_records[self._replay_index]
+            if record.recorded_at - self._replay_base_time > elapsed:
+                break
+            self._replay_index += 1
+            parsed = parse_gateway_frame(record.line)
+            if not parsed.get("valid") or parsed.get("frame_type") == "gateway_status":
+                self._replay_invalid_frames += int(not parsed.get("valid"))
+                continue
+            parsed["timestamp"] = time.time()
+            parsed["source"] = "replay"
+            if self._apply_sample(parsed, run_rules=True, mark_dirty=False):
+                applied = True
+        if applied:
+            self._dirty = True
+        if self._replay_index < len(self._replay_records):
+            return
+        self._replay_timer.stop()
+        path_name = self._replay_path.name if self._replay_path is not None else "记录文件"
+        skipped = self._replay_invalid_rows + self._replay_invalid_frames
+        self.status_changed.emit(f"回放完成：{path_name}，跳过 {skipped} 条异常记录", True)
+        self._append_event("REPLAY FINISHED", f"{path_name}，跳过 {skipped} 条", level="OK", kind="replay")
+        self._replay_records.clear()
+        self._replay_path = None
 
     @pyqtSlot()
     def export_csv(self) -> None:
@@ -977,12 +1219,20 @@ class DataManager(QObject):
         online_nodes = [node for node in self.nodes.values() if node.online]
         offline_nodes = [node for node in self.nodes.values() if not node.online]
         critical_matrix = [state for state in self.matrix.values() if self._derive_health(state) == HEALTH_CRITICAL]
+        gateway = self._gateway_status
         report_lines = [
             f"诊断时间：{now}",
             f"串口链路：{'已连接 ' + self.selected_port if self._serial_connected else '未连接'}",
             f"已发现节点：在线 {len(online_nodes)} / {len(self.nodes)}，离线 {len(offline_nodes)}",
             f"LoRa 矩阵：在线 {sum(1 for s in self.matrix.values() if s.online)} / {len(self.matrix)}，严重项 {len(critical_matrix)}",
             f"历史样本：{len(self.history)} 条；事件：{len(self.events)} 条",
+            (
+                "Gateway："
+                f"{gateway.get('gateway_id', '未上报')} {gateway.get('firmware', '')}；"
+                f"LoRa 成功 {gateway.get('rx_ok', '-')}；CRC 错误 {gateway.get('crc_errors', '-')}；"
+                f"长度异常 {gateway.get('bad_length', '-')}；队列丢包 {gateway.get('queue_drops', '-')}；"
+                f"Wi-Fi 节点 {gateway.get('wifi_clients', '-')}"
+            ),
             "建议：优先检查离线节点供电、天线连接与 Gateway 串口输出；本报告未向硬件下发任何指令。",
         ]
         self._diagnostics_report = "\n".join(report_lines)
@@ -1108,15 +1358,9 @@ class DataManager(QObject):
     def _auto_service(self) -> None:
         """自动探测真实 Gateway 串口；未发现时保持等待，不注入任何模拟数据。"""
 
-        now = time.time()
         if self._serial_connected:
-            if (
-                self._serial_auto_connected
-                and self._last_serial_sample_at <= 0
-                and now - self._serial_started_at > 4.0
-            ):
-                self.status_changed.emit("串口状态：串口无有效 Gateway 帧，断开并重新探测", False)
-                self.stop_serial()
+            # Gateway 只有在收到节点 LoRa 包后才输出 JSON。短时间无节点帧并不代表
+            # 串口失效，保持连接可避免 CH340 被反复打开以及 ESP32-S3 被重复复位。
             return
 
         self.refresh_ports()
@@ -1152,16 +1396,18 @@ class DataManager(QObject):
         if not self.available_ports:
             return None
 
-        try:
-            import serial
-        except Exception:
-            return None
+        preferred = [port for port in self._preferred_gateway_ports if port in self.available_ports]
+        if len(preferred) == 1:
+            # GW-02 的 CH340 可通过 USB VID/PID 唯一识别。直接交给持久读取器只打开
+            # 一次，避免“探测打开 -> 关闭 -> 正式打开”导致自研板发生二次复位。
+            return preferred[0]
 
-        for port in self.available_ports:
+        probe_ports = preferred + [port for port in self.available_ports if port not in preferred]
+        for port in probe_ports:
             try:
-                with serial.Serial(port=port, baudrate=BAUDRATE, timeout=0.12) as probe:
-                    deadline = time.time() + 0.75
-                    while time.time() < deadline:
+                with open_serial_port(port=port, baudrate=BAUDRATE, timeout=0.12) as probe:
+                    deadline = time.monotonic() + 3.0
+                    while time.monotonic() < deadline:
                         raw = probe.readline()
                         if not raw:
                             continue
@@ -1178,7 +1424,7 @@ class DataManager(QObject):
         self._serial_connected = True
         self.selected_port = port
         self.ports_changed.emit(self.available_ports, port)
-        self.status_changed.emit(f"串口状态：已连接 {port} @ {BAUDRATE}", True)
+        self.status_changed.emit(f"串口状态：已连接 {port} @ {BAUDRATE}，等待 Gateway 节点帧", True)
         self._append_event(
             "WIFI SYNC ESTABLISHED",
             f"{GATEWAY_ID} 串口链路已建立：{port}",
@@ -1206,7 +1452,7 @@ class DataManager(QObject):
 
         now = time.time()
         parsed["timestamp"] = now
-        parsed["source"] = "serial"
+        parsed["source"] = "serial_real"
         self._handle_frame_batch(
             [parsed],
             {"total": 1, "valid": 1, "invalid": 0, "dropped": 0, "pending": 0, "last_raw": raw_line},
@@ -1217,8 +1463,23 @@ class DataManager(QObject):
         """主线程低频消费后台解析好的串口帧批次。"""
 
         batch_stats = stats if isinstance(stats, dict) else {}
-        valid_frames = [frame for frame in frames if isinstance(frame, dict)] if isinstance(frames, list) else []
-        total = int(batch_stats.get("total") or len(valid_frames))
+        raw_lines = batch_stats.get("raw_lines")
+        if self._recorder.active and isinstance(raw_lines, list):
+            try:
+                self._recorder.append_many((str(line) for line in raw_lines), recorded_at=time.time())
+            except Exception as exc:  # noqa: BLE001
+                self._recorder.stop()
+                self.recording_state_changed.emit(False, f"录制写入失败：{exc}")
+        all_valid_frames = [frame for frame in frames if isinstance(frame, dict)] if isinstance(frames, list) else []
+        status_frames = [frame for frame in all_valid_frames if frame.get("frame_type") == "gateway_status"]
+        valid_frames = [frame for frame in all_valid_frames if frame.get("frame_type") != "gateway_status"]
+        for frame in status_frames:
+            payload = frame.get("gateway_status")
+            if isinstance(payload, dict):
+                self._gateway_status = dict(payload)
+                self._gateway_status["received_at"] = time.time()
+                self._dirty = True
+        total = int(batch_stats.get("total") or len(all_valid_frames))
         invalid = int(batch_stats.get("invalid") or 0)
         dropped = int(batch_stats.get("dropped") or 0)
         pending = int(batch_stats.get("pending") or 0)
@@ -1229,21 +1490,32 @@ class DataManager(QObject):
                 "last_batch_invalid": invalid,
                 "last_batch_dropped": dropped,
                 "last_batch_pending": pending,
-                "total_valid": self._serial_stats.get("total_valid", 0) + len(valid_frames),
+                "total_valid": self._serial_stats.get("total_valid", 0) + len(all_valid_frames),
                 "total_invalid": self._serial_stats.get("total_invalid", 0) + invalid,
                 "total_dropped": self._serial_stats.get("total_dropped", 0) + dropped,
+                "total_gateway_status": self._serial_stats.get("total_gateway_status", 0) + len(status_frames),
             }
         )
 
         now = time.time()
         if not valid_frames:
+            if status_frames:
+                gateway_id = str(self._gateway_status.get("gateway_id") or "Gateway")
+                firmware = str(self._gateway_status.get("firmware") or "")
+                self.status_changed.emit(f"串口状态：已连接 {gateway_id} {firmware}，等待节点数据", True)
             if invalid and now - self._last_invalid_frame_ui_at >= 1.0:
                 self._last_invalid_frame_ui_at = now
                 self._emit_latest_frame(f"忽略非 JSON 数据 {invalid} 行", now=now, force=True)
             self._maybe_report_serial_overload(pending, dropped, now)
             return
 
+        first_valid_batch = self._last_serial_sample_at <= 0
         self._last_serial_sample_at = max(_float(frame.get("timestamp"), now) for frame in valid_frames)
+        if first_valid_batch:
+            self.status_changed.emit(
+                f"串口状态：已连接 {self.selected_port} @ {BAUDRATE}，节点数据正常",
+                True,
+            )
         self._emit_latest_frame(
             self._batch_frame_summary(valid_frames[-1], total, len(valid_frames), invalid, dropped, pending),
             now=now,
@@ -1255,6 +1527,9 @@ class DataManager(QObject):
         latest_by_node: dict[int, dict[str, Any]] = {}
         applied = False
         for frame in valid_frames:
+            node_id = int(frame.get("node_id") or frame.get("id") or 0)
+            if self._is_controlled_node(node_id):
+                continue
             enriched = self._apply_sample(frame, run_rules=False, mark_dirty=False)
             if not enriched:
                 continue
@@ -1384,6 +1659,99 @@ class DataManager(QObject):
         if state.rssi < -100.0:
             return HEALTH_GOOD
         return HEALTH_EXCELLENT
+
+    # ------------------------------------------------------------------ 控制版样本注入
+    def _is_controlled_node(self, node_id: int) -> bool:
+        state = self._control_nodes.get(int(node_id))
+        return bool(state and state.enabled)
+
+    def _sync_control_timer(self) -> None:
+        has_enabled = any(state.enabled for state in self._control_nodes.values())
+        if has_enabled and not self._control_timer.isActive():
+            self._control_timer.start()
+        elif not has_enabled and self._control_timer.isActive():
+            self._control_timer.stop()
+
+    def _inject_control_samples(self) -> None:
+        enabled = [state for state in self._control_nodes.values() if state.enabled]
+        if not enabled or self._paused:
+            return
+
+        for state in enabled:
+            state.seq += 1
+            sample = self._build_control_sample(state)
+            enriched = self._apply_sample(sample, run_rules=True, mark_dirty=False)
+            if enriched:
+                self._emit_latest_frame(
+                    f"{NODE_LABELS.get(state.node_id, f'node{state.node_id}')} seq={state.seq} · 本批 1 行 / 有效 1 帧"
+                )
+        self._dirty = True
+
+    def _build_control_sample(self, state: ControlNodeState) -> dict[str, Any]:
+        now = time.time()
+        phase = int((now - self._control_started_at) * 10) + state.node_id * 7 + state.seq
+        drift = ((phase % 7) - 3) * 0.01
+        csi_on = bool(state.csi_value)
+        if csi_on:
+            presence = max(0.0, min(1.0, 0.85 + drift))
+            motion = max(0.0, min(1.0, 0.30 + drift * 0.8))
+            confidence = max(0.0, min(1.0, 0.92 + drift * 0.6))
+        else:
+            presence = max(0.0, min(1.0, 0.01 + max(drift, 0.0) * 0.4))
+            motion = max(0.0, min(1.0, 0.01 + max(-drift, 0.0) * 0.4))
+            confidence = max(0.0, min(1.0, 0.85 + drift * 0.4))
+
+        gas_raw = 520.0 + ((phase % 11) - 5) * 1.5
+        temperature = 27.0 + ((phase % 5) - 2) * 0.1
+        humidity = 45.0 + ((phase % 9) - 4) * 0.2
+        rssi = -58.0 + ((phase % 5) - 2)
+        return {
+            "timestamp": now,
+            "node_id": state.node_id,
+            "node_label": NODE_LABELS.get(state.node_id, f"node{state.node_id}"),
+            "seq": state.seq,
+            "presence_score": presence,
+            "motion_score": motion,
+            "confidence": confidence,
+            "breath_bpm": 18 if csi_on else 0,
+            "gas_raw": gas_raw,
+            "temperature": temperature,
+            "humidity": humidity,
+            "rssi": rssi,
+            "wifi_rssi": rssi + 3.0,
+            "csi_quality": 0.90 if csi_on else 0.82,
+            "csi_sample_count": 64,
+            "breath_lock": csi_on,
+            "noise_floor": 5.0 + abs(drift) * 10.0,
+            "source": "demo_mode",
+        }
+
+    def _build_mobile_presence_sample(self, node_id: int, value: float) -> dict[str, Any]:
+        """构造手机命令的即时样本，并沿用节点最近一次其他传感器字段。"""
+
+        node = self.nodes.get(node_id)
+        return {
+            "timestamp": time.time(),
+            "node_id": node_id,
+            "node_label": self._node_label(node_id),
+            "seq": (node.seq + 1) if node is not None and node.seq is not None else 1,
+            "presence_score": value,
+            "motion_score": node.motion_score if node is not None else 0.0,
+            "confidence": node.confidence if node is not None else 0.0,
+            "breath_bpm": node.breath_bpm if node is not None else 0.0,
+            "gas_raw": node.gas_raw if node is not None else 0.0,
+            "gas_ppm": node.gas_ppm if node is not None else 0.0,
+            "temperature": node.temperature if node is not None else 0.0,
+            "humidity": node.humidity if node is not None else 0.0,
+            "rssi": node.rssi if node is not None else 0.0,
+            "wifi_rssi": node.wifi_rssi if node is not None else 0.0,
+            "csi_quality": node.csi_quality if node is not None else None,
+            "csi_sample_count": node.csi_sample_count if node is not None else None,
+            "breath_lock": node.breath_lock if node is not None else None,
+            "noise_floor": node.noise_floor if node is not None else None,
+            "source": "mobile_override",
+        }
+
     def _load_gas_calibration_r0(self) -> float:
         settings = load_ui_settings()
         value = _float(settings.get("mq135_r0_kohm"), DEFAULT_MQ135_R0_KOHM)
@@ -1488,6 +1856,9 @@ class DataManager(QObject):
     ) -> dict[str, Any] | None:
         sample = self._apply_gas_calibration(sample)
         node_id = int(sample.get("node_id") or 0)
+        incoming_source = _canonical_sample_source(sample.get("source"))
+        if node_id > 0 and incoming_source == "serial_real":
+            self._last_real_samples[node_id] = dict(sample)
         node = self._ensure_node_state(node_id)
         matrix_state = self._ensure_matrix_node(node_id)
         if node is None:
@@ -1495,6 +1866,9 @@ class DataManager(QObject):
 
         now = float(sample.get("timestamp") or time.time())
         was_online = node.online
+        raw_presence_score = _score(sample.get("presence_score", sample.get("presence")))
+        mobile_presence_score = self._mobile_presence_overrides.get(node_id)
+        presence_score = mobile_presence_score if mobile_presence_score is not None else raw_presence_score
         label = str(sample.get("node_label") or "").strip()
         if label:
             node.label = label
@@ -1508,7 +1882,7 @@ class DataManager(QObject):
         node.packet_loss = _float(sample.get("packet_loss"), _packet_loss_from_rssi(node.rssi))
         node.last_received = now
         node.seq = _optional_int(sample.get("seq"))
-        node.presence_score = _score(sample.get("presence_score", sample.get("presence")))
+        node.presence_score = presence_score
         node.motion_score = _score(sample.get("motion_score", sample.get("motion")))
         node.breath_bpm = _float(sample.get("breath_bpm", sample.get("bpm")))
         node.confidence = _score(sample.get("confidence", sample.get("conf")))
@@ -1521,7 +1895,10 @@ class DataManager(QObject):
         node.gas = node.gas_ppm
         node.temperature = _float(sample.get("temperature", sample.get("temp")))
         node.humidity = _float(sample.get("humidity", sample.get("hum")))
-        node.source = str(sample.get("source", "serial"))
+        source = incoming_source
+        if mobile_presence_score is not None and source in {"serial_real", "replay"}:
+            source = "mobile_override"
+        node.source = source
         if matrix_state is not None:
             self._refresh_matrix_node(matrix_state, now)
 
@@ -1531,6 +1908,10 @@ class DataManager(QObject):
                 "timestamp": now,
                 "node_id": node_id,
                 "node_code": node.label,
+                "raw_presence_score": raw_presence_score,
+                "presence_score": node.presence_score,
+                "presence": node.presence_score,
+                "source": source,
                 "wifi_rssi": node.wifi_rssi,
                 "snr": node.snr,
                 "packet_loss": node.packet_loss,
@@ -1586,7 +1967,6 @@ class DataManager(QObject):
         has_presence = life_motion_triggered(
             node.to_dict(),
             presence_threshold=self.presence_threshold,
-            confidence_threshold=self.alarm_engine.confidence_threshold,
         )
 
         if has_presence and not self._presence_flags[node_id]:
@@ -1802,7 +2182,6 @@ class DataManager(QObject):
             nodes,
             self._recent_history(5.0, 1200),
             presence_threshold=self.presence_threshold,
-            confidence_threshold=self.alarm_engine.confidence_threshold,
         )
         node_lines: list[str] = []
         for node_id, node in sorted(nodes.items()):
@@ -1825,7 +2204,7 @@ class DataManager(QObject):
         ]
         thresholds = (
             f"presence>={self.presence_threshold:.2f}, "
-            f"confidence>={self.alarm_engine.confidence_threshold:.2f}, "
+            "confidence=diagnostic-only, csi_quality=diagnostic-only, "
             f"gas>={self.gas_threshold:.0f}ppm"
         )
         detail = self.ai_state.get("detail") if isinstance(self.ai_state.get("detail"), dict) else {}
@@ -1848,7 +2227,6 @@ class DataManager(QObject):
             self._node_dicts(),
             self._recent_history(5.0, 1200),
             presence_threshold=self.presence_threshold,
-            confidence_threshold=self.alarm_engine.confidence_threshold,
         )
         self._refresh_ai_fallback(summary)
         if not self.ai_settings.enabled or not self.ai_settings.embedding_enabled:
@@ -1912,7 +2290,6 @@ class DataManager(QObject):
             self._node_dicts(),
             self._recent_history(5.0, 1200),
             presence_threshold=self.presence_threshold,
-            confidence_threshold=self.alarm_engine.confidence_threshold,
         )
         if str(result.get("state_key", "")) != current_summary.state_key:
             now = time.time()
@@ -2069,7 +2446,6 @@ class DataManager(QObject):
             nodes,
             recent_history,
             presence_threshold=self.presence_threshold,
-            confidence_threshold=self.alarm_engine.confidence_threshold,
         )
         self._refresh_ai_fallback(summary)
         self.ai_state["running"] = self._ai_busy
@@ -2087,6 +2463,7 @@ class DataManager(QObject):
                 "history_total": len(self.history),
                 "ai": dict(self.ai_state),
                 "serial_stats": dict(self._serial_stats),
+                "gateway_status": dict(self._gateway_status),
                 "active_node": self._active_node,
                 "serial_connected": self._serial_connected,
                 "paused": self._paused,
@@ -2113,6 +2490,9 @@ class DataManager(QObject):
                     "online_matrix": sum(1 for s in self.matrix.values() if s.online),
                     "total_matrix": len(self.matrix),
                     "matrix_filter": self._matrix_filter,
+                    "recording_active": self._recorder.active,
+                    "replay_active": self._replay_timer.isActive(),
+                    "mobile_override_active": bool(self._mobile_presence_overrides),
                 },
             }
         )
@@ -2173,6 +2553,18 @@ def _float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _canonical_sample_source(value: Any) -> str:
+    """Normalize legacy source labels to stable export/UI identifiers."""
+
+    source = str(value or "serial_real").strip().lower()
+    aliases = {
+        "serial": "serial_real",
+        "control": "demo_mode",
+        "mobile": "mobile_override",
+    }
+    return aliases.get(source, source)
 
 
 def _optional_int(value: Any) -> int | None:

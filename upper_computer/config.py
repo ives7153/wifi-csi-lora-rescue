@@ -15,14 +15,21 @@ import json
 import os
 from pathlib import Path
 
+try:
+    from .version import DISPLAY_VERSION
+except ImportError:
+    if __package__:
+        raise
+    from version import DISPLAY_VERSION
+
 
 # ---------------------------------------------------------------------------
 # 品牌与基础常量
 # ---------------------------------------------------------------------------
 BRAND_NAME = "EchoGuard"
-BRAND_VERSION = "v0.3.1"
+BRAND_VERSION = DISPLAY_VERSION
 APP_TITLE = "EchoGuard"
-WINDOW_TITLE = "EchoGuard"
+WINDOW_TITLE = f"EchoGuard {BRAND_VERSION}"
 CONTROL_ID = "0xFF-AD-01"
 
 BAUDRATE = 115200
@@ -292,8 +299,8 @@ GAS_THRESHOLD_PPM = 1000.0      # MQ-135 CO2 估算 ppm 预警阈值
 GAS_ALARM_PPM = 2000.0          # 触发系统警告的 CO2 估算 ppm 上限
 GAS_THRESHOLD_RAW = GAS_THRESHOLD_PPM  # 兼容旧导入名；当前语义已迁移为 ppm
 GAS_ALARM_RAW = GAS_ALARM_PPM          # 兼容旧导入名；规则比较 ppm
-CONFIDENCE_THRESHOLD = 0.75     # 生命微动报警的置信度门限
-CSI_QUALITY_THRESHOLD = 0.45    # 可选 CSI 质量字段低于该值时只做观察，不触发稳定微动
+CONFIDENCE_THRESHOLD = 0.75     # 置信度诊断参考值，不参与存在感知硬判定
+CSI_QUALITY_THRESHOLD = 0.45    # CSI 质量诊断参考值，不参与存在感知硬判定
 ALARM_DEDUP_SECONDS = 5.0       # 同类报警去重窗口
 
 DEFAULT_AFH_ENABLED = True      # 自动频率跳变

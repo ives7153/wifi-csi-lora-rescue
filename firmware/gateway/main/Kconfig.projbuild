@@ -7,4 +7,17 @@ menu "EchoGuard Gateway Configuration"
             WPA2-PSK SoftAP name used by this Gateway build. Keep GW-01 as
             the default and override it in a local sdkconfig for GW-02.
 
+    config ECHOGUARD_GATEWAY_ID
+        string "Gateway identity reported to the upper computer"
+        default "GW-01"
+        help
+            Stable identity included in gateway_status JSON frames.
+
+    config ECHOGUARD_WIFI_PASSWORD
+        string "Gateway SoftAP WPA2 password"
+        default "511511511"
+        help
+            WPA2 password shared with Rescue Nodes. The value is never printed
+            to the runtime log.
+
 endmenu

@@ -13,6 +13,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFileDialog,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -217,6 +218,8 @@ class MainWindow(QMainWindow):
     ai_models_requested = pyqtSignal()
     ai_llm_test_requested = pyqtSignal()
     ai_action_requested = pyqtSignal(object)
+    recording_toggled = pyqtSignal(bool)
+    replay_requested = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -246,6 +249,11 @@ class MainWindow(QMainWindow):
         root_layout.setContentsMargins(0, 0, 0, 0)
         root_layout.setSpacing(0)
         root_layout.addWidget(self._build_top_bar())
+        self.demo_banner = QLabel("")
+        self.demo_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.demo_banner.setFixedHeight(34)
+        self.demo_banner.hide()
+        root_layout.addWidget(self.demo_banner)
 
         body = QHBoxLayout()
         body.setContentsMargins(0, 0, 0, 0)
@@ -343,6 +351,19 @@ class MainWindow(QMainWindow):
         self.nav_divider.setStyleSheet(f"background: {THEME['divider']};")
         layout.addWidget(self.nav_divider)
         layout.addSpacing(10)
+
+        capture_controls = QHBoxLayout()
+        capture_controls.setSpacing(8)
+        self.record_btn = QPushButton("开始录制")
+        self.record_btn.setObjectName("GhostButton")
+        self.record_btn.setCheckable(True)
+        self.record_btn.toggled.connect(self.recording_toggled.emit)
+        replay_btn = QPushButton("回放记录")
+        replay_btn.setObjectName("GhostButton")
+        replay_btn.clicked.connect(self._choose_replay_file)
+        capture_controls.addWidget(self.record_btn)
+        capture_controls.addWidget(replay_btn)
+        layout.addLayout(capture_controls)
 
         layout.addStretch(1)
 
@@ -470,6 +491,13 @@ class MainWindow(QMainWindow):
         self.toast_stack.show_toast(text, ok)
         self._position_toasts()
 
+    def set_recording_state(self, active: bool, message: str) -> None:
+        self.record_btn.blockSignals(True)
+        self.record_btn.setChecked(active)
+        self.record_btn.setText("停止录制" if active else "开始录制")
+        self.record_btn.blockSignals(False)
+        self.show_export_message(message, active or "已保存" in message)
+
     def show_ai_operation_message(self, text: str, ok: bool = True) -> None:
         self.dashboard_page.set_ai_operation_message(text, ok)
 
@@ -482,7 +510,43 @@ class MainWindow(QMainWindow):
     def update_snapshot(self, snapshot: dict[str, Any]) -> None:
         # 中文注释：串口高频输入时只刷新当前页；后台页切换显示时再吃最新快照。
         self._latest_snapshot = snapshot
+        self._update_data_source_banner(snapshot)
         self._refresh_current_page()
+
+    def _choose_replay_file(self) -> None:
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "选择 EchoGuard 录制文件",
+            "",
+            "EchoGuard JSONL (*.jsonl);;所有文件 (*.*)",
+        )
+        if path:
+            self.replay_requested.emit(path)
+
+    def _update_data_source_banner(self, snapshot: dict[str, Any]) -> None:
+        config = snapshot.get("config") if isinstance(snapshot.get("config"), dict) else {}
+        sources = {
+            str(node.get("source") or "")
+            for node in (snapshot.get("nodes") or {}).values()
+            if isinstance(node, dict) and node.get("online")
+        }
+        if config.get("mobile_override_active") or "mobile_override" in sources:
+            text = "演示数据已启用：存在感知值正由手机控制，停止服务或恢复全部可返回真实数据"
+            color = THEME["orange"]
+        elif "demo_mode" in sources:
+            text = "演示数据已启用：当前节点数值来自本地演示模式"
+            color = THEME["orange"]
+        elif config.get("replay_active") or "replay" in sources:
+            text = "数据回放中：当前数据来自录制文件，不是实时 Gateway 数据"
+            color = THEME["blue_bright"]
+        else:
+            self.demo_banner.hide()
+            return
+        self.demo_banner.setText(text)
+        self.demo_banner.setStyleSheet(
+            f"background: {THEME['warning_bg']}; color: {color}; border-bottom: 1px solid {color}; font-weight: 700;"
+        )
+        self.demo_banner.show()
 
     def _refresh_current_page(self) -> None:
         if self._latest_snapshot is None:

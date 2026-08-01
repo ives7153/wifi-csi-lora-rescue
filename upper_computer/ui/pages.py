@@ -1003,7 +1003,10 @@ class DashboardPage(QWidget):
 
         self.csi_plot.set_history(history, active_node, active_state)
         self._update_verdict(nodes, history, ai_state, config, snapshot.get("detection_summary"))
-        self.topology_widget.set_nodes(nodes)
+        self.topology_widget.set_nodes(
+            nodes,
+            _float(config.get("presence_threshold"), PRESENCE_THRESHOLD),
+        )
 
     def _toggle_pause(self) -> None:
         self._paused = not self._paused
@@ -1111,8 +1114,6 @@ class DashboardPage(QWidget):
             nodes,
             history,
             presence_threshold=_float(config.get("presence_threshold"), PRESENCE_THRESHOLD),
-            confidence_threshold=_float(config.get("confidence_threshold"), 0.75),
-            csi_quality_threshold=_float(config.get("csi_quality_threshold"), 0.45),
         )
         display_summary = self._stable_verdict_summary(summary)
         status = display_summary.status
@@ -1253,8 +1254,6 @@ class DashboardPage(QWidget):
         triggered = life_motion_triggered(
             state,
             presence_threshold=_float(config.get("presence_threshold"), PRESENCE_THRESHOLD),
-            confidence_threshold=_float(config.get("confidence_threshold"), 0.75),
-            csi_quality_threshold=_float(config.get("csi_quality_threshold"), 0.45),
         )
         motion_hint = "活跃" if motion >= 0.52 else "平稳"
         presence_text = "疑似微动" if triggered else "未检测"
@@ -1568,9 +1567,9 @@ class SensorMatrixPage(QWidget):
             minimum=0.0,
             maximum=1.0,
             value=PRESENCE_THRESHOLD,
-            value_fmt=lambda v: f"{v * 100:.0f}%",
-            min_label="MIN (0.1s)",
-            max_label="MAX (5.0s)",
+            value_fmt=lambda v: f"{v:.2f}",
+            min_label="MIN 0.00",
+            max_label="MAX 1.00",
         )
         self.presence_slider.valueChanged.connect(self.presence_threshold_changed.emit)
         layout.addWidget(self.presence_slider)
@@ -2698,7 +2697,7 @@ class HistoryPage(QWidget):
     export_filtered_csv_requested = pyqtSignal(object)
     clear_history_requested = pyqtSignal()
 
-    _COLUMNS = ("时间", "节点", "有效性", "存在", "运动", "置信度", "CO2 ppm", "温度", "湿度", "RSSI")
+    _COLUMNS = ("时间", "节点", "来源", "有效性", "存在", "运动", "置信度", "CO2 ppm", "温度", "湿度", "RSSI")
     _TABLE_MAX_ROWS = 500
 
     def __init__(self) -> None:
@@ -2764,7 +2763,7 @@ class HistoryPage(QWidget):
         self.table.cellDoubleClicked.connect(self._show_sample_detail)
         header_view = self.table.horizontalHeader()
         header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        fixed_widths = (86, 78, 72, 72, 78, 66, 70, 70, 78)
+        fixed_widths = (86, 86, 78, 72, 72, 78, 66, 70, 70, 78)
         for col, width in enumerate(fixed_widths, start=1):
             header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.Fixed)
             self.table.setColumnWidth(col, width)
@@ -2775,6 +2774,8 @@ class HistoryPage(QWidget):
             return
         nodes: dict[int, dict[str, Any]] = snapshot.get("nodes", {})
         history: list[dict[str, Any]] = snapshot.get("history", [])
+        config: dict[str, Any] = snapshot.get("config", {})
+        presence_threshold = _float(config.get("presence_threshold"), PRESENCE_THRESHOLD)
         history_total = int(snapshot.get("history_total") or len(history))
         self._refresh_history_nodes(nodes)
         filtered = self._filter_history(history)
@@ -2795,6 +2796,7 @@ class HistoryPage(QWidget):
             last_sample.get("node_id"),
             last_sample.get("seq"),
             last_sample.get("timestamp"),
+            presence_threshold,
         )
         if render_key == self._last_render_key:
             return
@@ -2819,7 +2821,8 @@ class HistoryPage(QWidget):
                 values = (
                     time.strftime("%H:%M:%S", time.localtime(ts)),
                     str(sample.get("node_code", sample.get("node_id", ""))),
-                    _sample_validity(sample),
+                    _data_source_label(sample.get("source")),
+                    _sample_validity(sample, presence_threshold),
                     f"{_score(sample.get('presence_score')):.2f}",
                     f"{_score(sample.get('motion_score')):.2f}",
                     f"{_score(sample.get('confidence')) * 100:.0f}%",
@@ -2880,6 +2883,7 @@ class HistoryPage(QWidget):
                 ("时间戳", sample.get("timestamp", "-")),
                 ("节点", sample.get("node_code", sample.get("node_id", "-"))),
                 ("序号", sample.get("seq", "-")),
+                ("数据来源", _data_source_label(sample.get("source"))),
                 ("Presence", f"{_score(sample.get('presence_score')):.2f}"),
                 ("Motion", f"{_score(sample.get('motion_score')):.2f}"),
                 ("Confidence", f"{_score(sample.get('confidence')) * 100:.0f}%"),
@@ -2904,6 +2908,20 @@ class HistoryPage(QWidget):
 
 
 # ---------------------------------------------------------------------------
+def _data_source_label(source: Any) -> str:
+    labels = {
+        "serial": "真实串口",
+        "serial_real": "真实串口",
+        "mobile": "手机演示",
+        "mobile_override": "手机演示",
+        "control": "本地演示",
+        "demo_mode": "本地演示",
+        "replay": "文件回放",
+    }
+    normalized = str(source or "serial_real").strip().lower()
+    return labels.get(normalized, normalized or "未知")
+
+
 def _show_detail_dialog(parent: QWidget, title: str, rows: tuple[tuple[str, Any], ...]) -> None:
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
@@ -2977,12 +2995,12 @@ def _matrix_advice(state: dict[str, Any]) -> tuple[str, str]:
     return "正常监测", THEME["blue_soft"]
 
 
-def _sample_validity(sample: dict[str, Any]) -> str:
+def _sample_validity(sample: dict[str, Any], presence_threshold: float = PRESENCE_THRESHOLD) -> str:
     confidence = _score(sample.get("confidence"))
     gas = _float(sample.get("gas"))
     if gas >= 550:
         return "异常"
-    if life_motion_triggered(sample):
+    if life_motion_triggered(sample, presence_threshold=presence_threshold):
         return "疑似微动"
     if confidence and confidence < 0.45:
         return "低置信"

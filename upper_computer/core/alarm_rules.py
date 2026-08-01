@@ -109,7 +109,6 @@ class AlarmEngine:
                 and life_motion_triggered(
                     sample,
                     presence_threshold=self.presence_threshold,
-                    confidence_threshold=self.confidence_threshold,
                 )
             ):
                 self._append(events, now, node_id, "life_motion", "疑似生命微动", level="ALARM")

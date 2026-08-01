@@ -13,6 +13,8 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "echoguard_protocol.h"
+#include "echoguard_lora.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -25,8 +27,16 @@
 #ifndef CONFIG_ECHOGUARD_GATEWAY_SSID
 #define CONFIG_ECHOGUARD_GATEWAY_SSID "EchoGuard-GW-01"
 #endif
+#ifndef CONFIG_ECHOGUARD_GATEWAY_ID
+#define CONFIG_ECHOGUARD_GATEWAY_ID "GW-01"
+#endif
+#ifndef CONFIG_ECHOGUARD_WIFI_PASSWORD
+#define CONFIG_ECHOGUARD_WIFI_PASSWORD "511511511"
+#endif
 #define WIFI_SOFTAP_SSID          CONFIG_ECHOGUARD_GATEWAY_SSID
-#define WIFI_SOFTAP_PASSWORD      "511511511"
+#define WIFI_SOFTAP_PASSWORD      CONFIG_ECHOGUARD_WIFI_PASSWORD
+#define GATEWAY_ID                CONFIG_ECHOGUARD_GATEWAY_ID
+#define GATEWAY_FIRMWARE_VERSION  "v0.3.3"
 #define WIFI_SOFTAP_CHANNEL       6
 #define WIFI_SOFTAP_MAX_CONN      4
 
@@ -47,7 +57,7 @@
 
 /* 队列和任务参数：包很小，队列长度 16 足够覆盖短时突发。 */
 #define LORA_QUEUE_LENGTH         16
-#define LORA_RX_PAYLOAD_LEN       14
+#define LORA_RX_PAYLOAD_LEN       ECHOGUARD_LORA_PAYLOAD_LEN
 #define WIFI_TASK_STACK_SIZE      4096
 #define LORA_TASK_STACK_SIZE      4096
 #define SERIAL_TASK_STACK_SIZE    4096
@@ -112,6 +122,11 @@ static EventGroupHandle_t s_wifi_event_group;
 static QueueHandle_t s_lora_queue;
 static spi_device_handle_t s_lora_spi;
 static esp_netif_t *s_softap_netif;
+static volatile uint32_t s_lora_rx_ok;
+static volatile uint32_t s_lora_crc_errors;
+static volatile uint32_t s_lora_bad_length;
+static volatile uint32_t s_lora_parse_errors;
+static volatile uint32_t s_lora_queue_drops;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void udp_keepalive_task(void *arg);
@@ -122,6 +137,7 @@ static void lora_write_reg(uint8_t reg, uint8_t value);
 static uint8_t lora_read_reg(uint8_t reg);
 static bool lora_receive_once(rescue_lora_packet_t *packet);
 static bool parse_lora_payload(const uint8_t *payload, size_t len, rescue_lora_packet_t *packet);
+static void gateway_print_status(void);
 
 /* 串口初始化：ESP32-S3 USB Serial/JTAG 由 sdkconfig.defaults 选择，stdio 直接输出到上位机。 */
 static void serial_console_init(void)
@@ -298,6 +314,7 @@ static void lora_receive_task(void *arg)
 
         if (lora_receive_once(&packet)) {
             if (xQueueSend(s_lora_queue, &packet, 0) != pdTRUE) {
+                ++s_lora_queue_drops;
                 ESP_LOGE(TAG, "LoRa queue full, dropping packet id=%u seq=%" PRIu32,
                          packet.id, packet.seq);
             }
@@ -312,28 +329,60 @@ static void serial_forward_task(void *arg)
 {
     (void)arg;
 
+    int64_t last_status_ms = -10000;
     while (true) {
         rescue_lora_packet_t packet = {0};
-        if (xQueueReceive(s_lora_queue, &packet, portMAX_DELAY) != pdTRUE) {
-            continue;
+        if (xQueueReceive(s_lora_queue, &packet, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            printf("{\"id\":%u,\"seq\":%" PRIu32 ",\"presence\":%u,\"motion\":%u,"
+                   "\"bpm\":%u,\"conf\":%u,\"gas\":%u,\"temp\":%.1f,"
+                   "\"hum\":%u,\"rssi\":%d,\"ts\":%" PRId64 "}\n",
+                   packet.id,
+                   packet.seq,
+                   packet.presence,
+                   packet.motion,
+                   packet.bpm,
+                   packet.conf,
+                   packet.gas,
+                   (double)packet.temp_x10 / 10.0,
+                   packet.hum,
+                   packet.rssi,
+                   packet.ts_ms);
+            fflush(stdout);
         }
 
-        printf("{\"id\":%u,\"seq\":%" PRIu32 ",\"presence\":%u,\"motion\":%u,"
-               "\"bpm\":%u,\"conf\":%u,\"gas\":%u,\"temp\":%.1f,"
-               "\"hum\":%u,\"rssi\":%d,\"ts\":%" PRId64 "}\n",
-               packet.id,
-               packet.seq,
-               packet.presence,
-               packet.motion,
-               packet.bpm,
-               packet.conf,
-               packet.gas,
-               (double)packet.temp_x10 / 10.0,
-               packet.hum,
-               packet.rssi,
-               packet.ts_ms);
-        fflush(stdout);
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        if (now_ms - last_status_ms >= 10000) {
+            last_status_ms = now_ms;
+            gateway_print_status();
+        }
     }
+}
+
+static void gateway_print_status(void)
+{
+    wifi_sta_list_t clients = {0};
+    uint16_t client_count = 0;
+    if (esp_wifi_ap_get_sta_list(&clients) == ESP_OK) {
+        client_count = clients.num;
+    }
+    printf("{\"type\":\"gateway_status\",\"protocol\":%d,\"firmware\":\"%s\","
+           "\"gateway_id\":\"%s\",\"ssid\":\"%s\",\"uptime_ms\":%" PRId64 ","
+           "\"rx_ok\":%" PRIu32 ",\"crc_errors\":%" PRIu32 ","
+           "\"bad_length\":%" PRIu32 ",\"parse_errors\":%" PRIu32 ","
+           "\"queue_drops\":%" PRIu32 ",\"queue_depth\":%u,\"wifi_clients\":%u}\n",
+           ECHOGUARD_PROTOCOL_VERSION,
+           GATEWAY_FIRMWARE_VERSION,
+           GATEWAY_ID,
+           WIFI_SOFTAP_SSID,
+           esp_timer_get_time() / 1000,
+           s_lora_rx_ok,
+           s_lora_crc_errors,
+           s_lora_bad_length,
+           s_lora_parse_errors,
+           s_lora_queue_drops,
+           (unsigned)uxQueueMessagesWaiting(s_lora_queue),
+           (unsigned)client_count);
+    fflush(stdout);
 }
 
 static void nvs_init_for_wifi(void)
@@ -449,7 +498,7 @@ static esp_err_t lora_chip_configure(void)
     lora_set_op_mode(MODE_SLEEP);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    const uint64_t frf = ((uint64_t)LORA_FREQ_HZ << 19) / 32000000UL;
+    const uint32_t frf = echoguard_lora_frequency_register(LORA_FREQ_HZ);
     lora_write_reg(REG_FRF_MSB, (uint8_t)(frf >> 16));
     lora_write_reg(REG_FRF_MID, (uint8_t)(frf >> 8));
     lora_write_reg(REG_FRF_LSB, (uint8_t)frf);
@@ -526,6 +575,7 @@ static bool lora_receive_once(rescue_lora_packet_t *packet)
     }
 
     if ((irq_flags & IRQ_PAYLOAD_CRC_ERROR) != 0) {
+        ++s_lora_crc_errors;
         ESP_LOGW(TAG, "LoRa CRC error, irq=0x%02x", irq_flags);
         lora_write_reg(REG_IRQ_FLAGS, 0xFF);
         lora_set_op_mode(MODE_RX_CONTINUOUS);
@@ -552,18 +602,21 @@ static bool lora_receive_once(rescue_lora_packet_t *packet)
     lora_set_op_mode(MODE_RX_CONTINUOUS);
 
     if (payload_len != LORA_RX_PAYLOAD_LEN) {
+        ++s_lora_bad_length;
         ESP_LOGW(TAG, "Unexpected LoRa payload length=%u, expected=%u",
                  payload_len, LORA_RX_PAYLOAD_LEN);
         return false;
     }
 
     if (!parse_lora_payload(payload, payload_len, packet)) {
+        ++s_lora_parse_errors;
         ESP_LOGW(TAG, "Failed to parse LoRa payload");
         return false;
     }
 
     packet->rssi = rssi;
     packet->ts_ms = esp_timer_get_time() / 1000;
+    ++s_lora_rx_ok;
     return true;
 }
 
@@ -573,22 +626,19 @@ static bool parse_lora_payload(const uint8_t *payload, size_t len, rescue_lora_p
         return false;
     }
 
-    /* LoRa v1 小端二进制帧：
-     * id:u8, seq:u32, presence:u8, motion:u8, bpm:u8, conf:u8,
-     * gas:u16, temp_x10:i16, hum:u8。
-     */
-    packet->id = payload[0];
-    packet->seq = ((uint32_t)payload[1]) |
-                  ((uint32_t)payload[2] << 8) |
-                  ((uint32_t)payload[3] << 16) |
-                  ((uint32_t)payload[4] << 24);
-    packet->presence = payload[5];
-    packet->motion = payload[6];
-    packet->bpm = payload[7];
-    packet->conf = payload[8];
-    packet->gas = (uint16_t)payload[9] | ((uint16_t)payload[10] << 8);
-    packet->temp_x10 = (int16_t)((uint16_t)payload[11] | ((uint16_t)payload[12] << 8));
-    packet->hum = payload[13];
+    echoguard_payload_t decoded = {0};
+    if (!echoguard_payload_decode(payload, len, &decoded)) {
+        return false;
+    }
+    packet->id = decoded.id;
+    packet->seq = decoded.seq;
+    packet->presence = decoded.presence;
+    packet->motion = decoded.motion;
+    packet->bpm = decoded.bpm;
+    packet->conf = decoded.conf;
+    packet->gas = decoded.gas;
+    packet->temp_x10 = decoded.temp_x10;
+    packet->hum = decoded.hum;
 
     return true;
 }

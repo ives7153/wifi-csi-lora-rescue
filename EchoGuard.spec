@@ -2,11 +2,14 @@
 """PyInstaller build spec for the EchoGuard PyQt upper computer."""
 
 from pathlib import Path
+import runpy
 
 from PyInstaller.utils.hooks import collect_submodules
 
 
 project_root = Path(SPECPATH)
+version_info = runpy.run_path(str(project_root / "upper_computer" / "version.py"))
+dist_name = version_info["STANDARD_DIST_NAME"]
 assets_dir = project_root / "upper_computer" / "assets"
 icon_path = assets_dir / "app_icon.ico"
 
@@ -70,5 +73,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name="EchoGuard",
+    name=dist_name,
 )

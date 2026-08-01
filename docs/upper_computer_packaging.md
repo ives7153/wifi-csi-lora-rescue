@@ -1,6 +1,6 @@
 # EchoGuard 上位机打包说明
 
-本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。v0.2.0 起，上位机包含 SHT20 文案同步与 MQ-135 CO2 估算 ppm 标定能力。打包目标是上位机主体，不包含 Jina GGUF 模型和 `llama-server.exe`。
+本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。v0.3.3 提供普通监测版和无密码手机演示控制版，两者共用数据、报警、AI、录制回放与导出核心。打包目标不包含 Jina GGUF 模型和 `llama-server.exe`。
 
 ## 打包前检查
 
@@ -9,6 +9,7 @@
 ```powershell
 python -m pip install -r requirements-build.txt
 python -m compileall upper_computer
+python -m unittest discover -s tests -p "test_*.py" -v
 ```
 
 上位机正式入口为：
@@ -23,6 +24,7 @@ python -m upper_computer.main
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\build_upper_computer.ps1
+powershell -ExecutionPolicy Bypass -File scripts\build_upper_computer_mobile_v033.ps1
 ```
 
 也可以直接执行：
@@ -35,7 +37,9 @@ python -m PyInstaller --clean --noconfirm EchoGuard.spec
 
 ```text
 dist/
-└── EchoGuard/
+├── EchoGuard-v0.3.3-windows/
+│   └── EchoGuard.exe
+└── EchoGuard-Mobile-v0.3.3-windows/
     └── EchoGuard.exe
 ```
 
@@ -64,14 +68,37 @@ dist/
 
 不要把 GGUF 模型、`llama-server.exe` 或 `EchoGuard-AI-Runtime.zip` 提交到 GitHub。
 
+Jina 只作为本地 embedding/向量检索服务使用；AI 对话的自然语言生成来自可选大模型 API 或规则模板回退。
+
 ## 打包后验收
 
-启动 `dist\EchoGuard\EchoGuard.exe` 后检查：
+启动两个发行目录中的 `EchoGuard.exe` 后检查：
 
 - 窗口标题、任务栏名称和图标均为 `EchoGuard`。
 - 侧边导航图标和太阳/月亮主题按钮正常。
 - Gateway 串口可刷新、连接、显示最新帧。
 - 节点收到数据后自动出现在仪表盘、节点管理、分析、历史和诊断页。
-- 环境状态中显示 `CO2 估算 ppm`，传感器页可执行 `MQ-135 清洁空气校准`。
-- CSV 导出、融合扰动曲线截图、整窗截图可写入 `upper_computer/exports/`。
-- 无本地 Jina 或 API 时，AI 区域保持规则回退，不影响主界面运行。
+- 环境状态中显示 `CO2 估算 ppm`，传感器页可执行当前节点校准和全部在线节点校准。
+- CSV 导出、历史记录导出、融合扰动曲线截图、整窗截图可写入 `upper_computer/exports/`，成功后右上角出现自动消失的 toast 提示。
+- `AI 辅助` 导航页可打开，右侧上下文栏可滚动，中间对话区支持 Markdown 显示并在发送后自动滚动到底部。
+- 无本地 Jina 或 API 时，AI 区域保持规则回退，AI 对话可用本地模板回答，不影响主界面运行。
+- 普通版不启动手机 HTTP 服务；Mobile 版可隐藏到系统托盘，并在覆盖存在数值时显示醒目的“手机演示数据”标识。
+- “开始录制”生成 JSONL 文件；断开串口后可选择该文件回放，历史和 CSV 来源显示为“文件回放”。
+
+## Release 打包建议
+
+执行以下脚本可同时构建两个版本、生成 ZIP 和 SHA-256：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\package_releases.ps1
+```
+
+正式分发包命名为：
+
+```text
+EchoGuard-v0.3.3-windows.zip
+EchoGuard-Mobile-v0.3.3-windows.zip
+SHA256SUMS.txt
+```
+
+zip 不包含 `upper_computer/models/`、`upper_computer/runtime/`、`upper_computer/exports/` 或 GGUF 模型文件。

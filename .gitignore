@@ -19,10 +19,12 @@
 # Build artifacts and directories
 **/build/
 build/
+**/build-*/
 *.o
 *.a
 *.out
-*.exe # For any host-side utilities compiled on Windows
+# Host-side executables compiled on Windows
+*.exe
 
 # ESP-IDF specific build outputs
 *.bin
@@ -31,6 +33,7 @@ build/
 flasher_args.json # Generated in build directory
 sdkconfig.old
 sdkconfig
+sdkconfig.*.local
 
 # ESP-IDF dependencies
 # For older versions or manual component management
@@ -55,12 +58,25 @@ CTestTestfile.cmake
 __pycache__/
 *.egg-info/
 dist/
+releases/
 
 # Upper computer local AI runtime/model payloads
 upper_computer/models/
 upper_computer/runtime/
 upper_computer/exports/
 *.gguf
+
+# Local agent/browser state and private working copies
+.openteams/
+.playwright-mcp/
+core_code/
+core_code.zip
+*.docx
+
+# Historical local-only packaging variants
+/EchoGuardV03.spec
+/EchoGuardV032HardThreshold.spec
+/GatewayCapture.spec
 
 # Virtual environment folders
 venv/

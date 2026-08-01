@@ -75,6 +75,8 @@ def main() -> int:
     window.ai_models_requested.connect(manager.fetch_ai_models)
     window.ai_llm_test_requested.connect(manager.test_llm_api)
     window.ai_action_requested.connect(manager.handle_ai_action)
+    window.recording_toggled.connect(manager.set_recording_enabled)
+    window.replay_requested.connect(manager.replay_recording)
 
     # ---------------- DataManager -> UI ----------------
     manager.ports_changed.connect(window.update_ports)
@@ -84,6 +86,7 @@ def main() -> int:
     manager.ai_operation_message_changed.connect(window.show_ai_operation_message)
     manager.ai_operation_result_changed.connect(window.set_ai_operation_result)
     manager.ai_models_changed.connect(window.set_ai_models)
+    manager.recording_state_changed.connect(window.set_recording_state)
     manager.snapshot_changed.connect(window.update_snapshot)
 
     app.aboutToQuit.connect(manager.shutdown)

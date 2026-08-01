@@ -18,6 +18,10 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
+#include "echoguard_protocol.h"
+#include "aht20_crc.h"
+#include "echoguard_lora.h"
+#include "wifi_gateway_selector.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/semphr.h"
@@ -30,10 +34,19 @@
 #ifndef CONFIG_RESCUE_NODE_ID
 #define CONFIG_RESCUE_NODE_ID           1
 #endif
+#ifndef CONFIG_ECHOGUARD_PRIMARY_SSID
+#define CONFIG_ECHOGUARD_PRIMARY_SSID   "EchoGuard-GW-01"
+#endif
+#ifndef CONFIG_ECHOGUARD_SECONDARY_SSID
+#define CONFIG_ECHOGUARD_SECONDARY_SSID "EchoGuard-GW-02"
+#endif
+#ifndef CONFIG_ECHOGUARD_WIFI_PASSWORD
+#define CONFIG_ECHOGUARD_WIFI_PASSWORD  "511511511"
+#endif
 #define NODE_ID                         CONFIG_RESCUE_NODE_ID
-#define WIFI_PRIMARY_SSID               "EchoGuard-GW-01"
-#define WIFI_SECONDARY_SSID             "EchoGuard-GW-02"
-#define WIFI_STA_PASSWORD               "511511511"
+#define WIFI_PRIMARY_SSID               CONFIG_ECHOGUARD_PRIMARY_SSID
+#define WIFI_SECONDARY_SSID             CONFIG_ECHOGUARD_SECONDARY_SSID
+#define WIFI_STA_PASSWORD               CONFIG_ECHOGUARD_WIFI_PASSWORD
 #define WIFI_SCAN_MAX_APS               16
 #define WIFI_RESELECT_DELAY_MS          2000
 #define WIFI_CONNECT_TIMEOUT_MS         12000
@@ -65,7 +78,7 @@
 #define LORA_FREQ_HZ                    433000000UL
 #define LORA_SPI_CLOCK_HZ               (4 * 1000 * 1000)
 #define LORA_EXPECTED_VERSION           0x12
-#define LORA_TX_PAYLOAD_LEN             14
+#define LORA_TX_PAYLOAD_LEN             ECHOGUARD_LORA_PAYLOAD_LEN
 #define LORA_TX_TIMEOUT_MS              1000
 
 /* 节点传感器引脚：AHT20 与 MPU6050 共用 I2C，MQ-135 使用 GPIO6 ADC 输入。 */
@@ -130,20 +143,8 @@
 
 #define IRQ_TX_DONE                     0x08
 
-/* 与 Gateway 完全一致的数据结构。注意：LoRa 发送时仍显式打包 14 字节，避免结构体 padding 影响空口协议。 */
-typedef struct {
-    uint8_t id;
-    uint32_t seq;
-    uint8_t presence;
-    uint8_t motion;
-    uint8_t bpm;
-    uint8_t conf;
-    uint16_t gas;
-    int16_t temp_x10;
-    uint8_t hum;
-    int16_t rssi;
-    int64_t ts_ms;
-} rescue_lora_packet_t;
+/* Node 与 Gateway 共用显式 14 字节协议编解码，避免结构体 padding 或字段漂移。 */
+typedef echoguard_payload_t rescue_lora_packet_t;
 
 typedef struct {
     uint8_t presence_score;
@@ -174,11 +175,9 @@ typedef struct {
     const char *password;
 } wifi_gateway_profile_t;
 
-enum {
-    WIFI_GATEWAY_PRIMARY = 0,
-    WIFI_GATEWAY_SECONDARY = 1,
-    WIFI_GATEWAY_NONE = -1,
-};
+#define WIFI_GATEWAY_PRIMARY ECHOGUARD_GATEWAY_PRIMARY
+#define WIFI_GATEWAY_SECONDARY ECHOGUARD_GATEWAY_SECONDARY
+#define WIFI_GATEWAY_NONE ECHOGUARD_GATEWAY_NONE
 
 static const wifi_gateway_profile_t s_gateway_profiles[] = {
     [WIFI_GATEWAY_PRIMARY] = {
@@ -205,6 +204,7 @@ static bool s_i2c_scan_done;
 static int64_t s_last_i2c_scan_ms;
 static bool s_aht20_initialized;
 static bool s_aht20_logged_first_read;
+static uint32_t s_aht20_crc_errors;
 static volatile int8_t s_selected_gateway = WIFI_GATEWAY_NONE;
 static volatile int8_t s_connected_gateway = WIFI_GATEWAY_NONE;
 static volatile uint8_t s_primary_connect_failures;
@@ -432,33 +432,29 @@ static esp_err_t wifi_select_and_connect(void)
         (void)esp_wifi_clear_ap_list();
     }
 
-    bool visible[2] = {false, false};
-    uint8_t channel[2] = {0, 0};
-    int8_t rssi[2] = {0, 0};
+    echoguard_gateway_candidate_t candidates[2] = {0};
     for (uint16_t i = 0; i < record_count; ++i) {
         for (int gateway = WIFI_GATEWAY_PRIMARY; gateway <= WIFI_GATEWAY_SECONDARY; ++gateway) {
             if (strcmp((const char *)records[i].ssid, s_gateway_profiles[gateway].ssid) == 0 &&
                 records[i].authmode >= WIFI_AUTH_WPA2_PSK) {
-                visible[gateway] = true;
-                channel[gateway] = records[i].primary;
-                rssi[gateway] = records[i].rssi;
+                candidates[gateway].visible = true;
+                candidates[gateway].channel = records[i].primary;
+                candidates[gateway].rssi = records[i].rssi;
             }
         }
     }
     free(records);
 
-    int selected = WIFI_GATEWAY_NONE;
-    if (visible[WIFI_GATEWAY_PRIMARY] &&
-        (s_primary_connect_failures < WIFI_PRIMARY_FAILURE_LIMIT ||
-         !visible[WIFI_GATEWAY_SECONDARY])) {
-        selected = WIFI_GATEWAY_PRIMARY;
-    } else if (visible[WIFI_GATEWAY_SECONDARY]) {
-        selected = WIFI_GATEWAY_SECONDARY;
-    }
+    int selected = echoguard_select_gateway(
+        candidates,
+        s_primary_connect_failures,
+        WIFI_PRIMARY_FAILURE_LIMIT
+    );
 
     if (selected == WIFI_GATEWAY_NONE) {
         ESP_LOGW(TAG, "扫描未发现可用 Gateway: primary=%d secondary=%d",
-                 visible[WIFI_GATEWAY_PRIMARY], visible[WIFI_GATEWAY_SECONDARY]);
+                 candidates[WIFI_GATEWAY_PRIMARY].visible,
+                 candidates[WIFI_GATEWAY_SECONDARY].visible);
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -469,7 +465,7 @@ static esp_err_t wifi_select_and_connect(void)
              s_gateway_profiles[selected].password);
     wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
     wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-    wifi_config.sta.channel = channel[selected];
+    wifi_config.sta.channel = candidates[selected].channel;
     wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     wifi_config.sta.pmf_cfg.capable = true;
     wifi_config.sta.pmf_cfg.required = false;
@@ -478,7 +474,7 @@ static esp_err_t wifi_select_and_connect(void)
                         TAG, "esp_wifi_set_config STA failed");
     s_selected_gateway = selected;
     ESP_LOGI(TAG, "选择 Gateway: ssid=%s channel=%u rssi=%d primary_failures=%u",
-             wifi_gateway_name(selected), channel[selected], rssi[selected],
+             wifi_gateway_name(selected), candidates[selected].channel, candidates[selected].rssi,
              s_primary_connect_failures);
 
     ret = esp_wifi_connect();
@@ -1157,6 +1153,15 @@ static esp_err_t aht20_read(float *temperature_c, float *humidity_percent)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (!aht20_measurement_crc_valid(data)) {
+        ++s_aht20_crc_errors;
+        if (s_aht20_crc_errors <= 3 || (s_aht20_crc_errors % 30) == 0) {
+            ESP_LOGW(TAG, "AHT20 CRC mismatch count=%" PRIu32 " expected=0x%02x actual=0x%02x",
+                     s_aht20_crc_errors, aht20_crc8(data, 6), data[6]);
+        }
+        return ESP_ERR_INVALID_CRC;
+    }
+
     uint32_t raw_hum = ((uint32_t)data[1] << 12) | ((uint32_t)data[2] << 4) | ((uint32_t)data[3] >> 4);
     uint32_t raw_temp = (((uint32_t)data[3] & 0x0F) << 16) | ((uint32_t)data[4] << 8) | data[5];
     if (raw_hum == 0 && raw_temp == 0) {
@@ -1266,8 +1271,6 @@ static void lora_send_task(void *arg)
             .gas = sample.gas_raw,
             .temp_x10 = sample.temp_x10,
             .hum = sample.humidity,
-            .rssi = 0,
-            .ts_ms = esp_timer_get_time() / 1000,
         };
 
         esp_err_t ret = lora_send_packet(&packet);
@@ -1357,7 +1360,7 @@ static esp_err_t lora_chip_configure(void)
     lora_set_op_mode(MODE_SLEEP);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    const uint64_t frf = ((uint64_t)LORA_FREQ_HZ << 19) / 32000000UL;
+    const uint32_t frf = echoguard_lora_frequency_register(LORA_FREQ_HZ);
     lora_write_reg(REG_FRF_MSB, (uint8_t)(frf >> 16));
     lora_write_reg(REG_FRF_MID, (uint8_t)(frf >> 8));
     lora_write_reg(REG_FRF_LSB, (uint8_t)frf);
@@ -1425,20 +1428,9 @@ static esp_err_t lora_send_packet(const rescue_lora_packet_t *packet)
 
 static void build_lora_payload(const rescue_lora_packet_t *packet, uint8_t payload[LORA_TX_PAYLOAD_LEN])
 {
-    payload[0] = packet->id;
-    payload[1] = (uint8_t)(packet->seq & 0xFF);
-    payload[2] = (uint8_t)((packet->seq >> 8) & 0xFF);
-    payload[3] = (uint8_t)((packet->seq >> 16) & 0xFF);
-    payload[4] = (uint8_t)((packet->seq >> 24) & 0xFF);
-    payload[5] = packet->presence;
-    payload[6] = packet->motion;
-    payload[7] = packet->bpm;
-    payload[8] = packet->conf;
-    payload[9] = (uint8_t)(packet->gas & 0xFF);
-    payload[10] = (uint8_t)((packet->gas >> 8) & 0xFF);
-    payload[11] = (uint8_t)((uint16_t)packet->temp_x10 & 0xFF);
-    payload[12] = (uint8_t)(((uint16_t)packet->temp_x10 >> 8) & 0xFF);
-    payload[13] = packet->hum;
+    if (!echoguard_payload_encode(packet, payload)) {
+        memset(payload, 0, LORA_TX_PAYLOAD_LEN);
+    }
 }
 
 static void lora_set_op_mode(uint8_t mode)
