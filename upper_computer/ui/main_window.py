@@ -533,7 +533,7 @@ class MainWindow(QMainWindow):
         if config.get("mobile_override_active") or "mobile_override" in sources:
             text = "演示数据已启用：存在感知值正由手机控制，停止服务或恢复全部可返回真实数据"
             color = THEME["orange"]
-        elif "demo_mode" in sources:
+        elif "demo_mode" in sources and not config.get("startup_presence_demo_active"):
             text = "演示数据已启用：当前节点数值来自本地演示模式"
             color = THEME["orange"]
         elif config.get("replay_active") or "replay" in sources:

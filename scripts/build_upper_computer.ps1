@@ -3,7 +3,14 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Resolve-Path (Join-Path $PSScriptRoot "..")
 Set-Location $repoRoot
 
+function Assert-NativeSuccess([string]$step, [int]$exitCode) {
+    if ($exitCode -ne 0) {
+        throw "$step failed with exit code $exitCode"
+    }
+}
+
 python -m compileall upper_computer
+Assert-NativeSuccess "Python compileall" $LASTEXITCODE
 
 $hasPyInstaller = python -c "import importlib.util; raise SystemExit(0 if importlib.util.find_spec('PyInstaller') else 1)"
 if ($LASTEXITCODE -ne 0) {
@@ -11,6 +18,12 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 python -m PyInstaller --clean --noconfirm EchoGuard.spec
+Assert-NativeSuccess "Standard PyInstaller build" $LASTEXITCODE
 
 $distName = python -c "from upper_computer.version import STANDARD_DIST_NAME; print(STANDARD_DIST_NAME)"
+Assert-NativeSuccess "Read standard release name" $LASTEXITCODE
+$executable = Join-Path $repoRoot "dist\$distName\EchoGuard.exe"
+if (-not (Test-Path -LiteralPath $executable)) {
+    throw "Missing standard executable: $executable"
+}
 Write-Host "EchoGuard build complete: dist\$distName\EchoGuard.exe"

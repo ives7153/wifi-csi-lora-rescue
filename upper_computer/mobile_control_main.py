@@ -45,7 +45,8 @@ def main() -> int:
     set_theme_mode(str(load_ui_settings().get("theme_mode", "dark")))
     app.setStyleSheet(build_qss())
 
-    manager = DataManager()
+    # Mobile 版只接受显式手机控制，不启用普通版的 20 秒启动演示。
+    manager = DataManager(startup_presence_demo_seconds=0.0)
     window = MainWindow()
     window.setWindowTitle(WINDOW_TITLE)
     panel = MobileControlPanel()

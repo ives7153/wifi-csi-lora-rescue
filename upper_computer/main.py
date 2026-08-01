@@ -39,7 +39,9 @@ def main() -> int:
     set_theme_mode(str(load_ui_settings().get("theme_mode", "dark")))
     app.setStyleSheet(build_qss())
 
-    manager = DataManager()
+    # 普通演示版：每个节点首次连接后的 20 秒内仅展示低于 0.1 的变化值；
+    # 不显示倒计时，窗口结束后自动恢复节点真实存在值。
+    manager = DataManager(startup_presence_demo_seconds=20.0)
     window = MainWindow()
     window.setWindowTitle(WINDOW_TITLE)
     if not app_icon.isNull():

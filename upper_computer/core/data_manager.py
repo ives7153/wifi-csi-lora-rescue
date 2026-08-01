@@ -371,8 +371,16 @@ class DataManager(QObject):
     _ai_operation_result_ready = pyqtSignal(object)
     _ai_models_ready = pyqtSignal(object, bool, str)
 
-    def __init__(self, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        startup_presence_demo_seconds: float = 0.0,
+    ) -> None:
         super().__init__(parent)
+
+        self.startup_presence_demo_seconds = max(0.0, float(startup_presence_demo_seconds))
+        self._startup_presence_demo_started_at: dict[int, float] = {}
 
         self.started_at = time.time()
         self.available_ports: list[str] = []
@@ -1340,6 +1348,7 @@ class DataManager(QObject):
 
         self._serial_connected = False
         self._last_serial_sample_at = 0.0
+        self._startup_presence_demo_started_at.clear()
 
         worker = self._worker
         thread = self._thread
@@ -1847,6 +1856,31 @@ class DataManager(QObject):
             node.gas_ppm = calculate_gas_ppm(node.gas_raw, self._gas_r0_for_node(node_id))
             node.gas = node.gas_ppm
 
+    def _startup_demo_presence(
+        self,
+        node_id: int,
+        incoming_source: str,
+        *,
+        was_online: bool,
+        seq: int | None,
+    ) -> float | None:
+        """Return a changing sub-0.1 value during the standard-edition startup demo."""
+
+        if self.startup_presence_demo_seconds <= 0.0 or node_id <= 0 or incoming_source != "serial_real":
+            return None
+
+        now = time.monotonic()
+        if not was_online or node_id not in self._startup_presence_demo_started_at:
+            self._startup_presence_demo_started_at[node_id] = now
+        started_at = self._startup_presence_demo_started_at[node_id]
+        elapsed = max(0.0, now - started_at)
+        if elapsed >= self.startup_presence_demo_seconds:
+            return None
+
+        # 0.01..0.09 循环变化。优先跟随节点序号；旧协议无序号时按时间变化。
+        phase = int(seq) if seq is not None else int(elapsed * 5.0)
+        return round(0.01 + ((phase + node_id * 3) % 9) * 0.01, 2)
+
     # ------------------------------------------------------------------ 样本应用
     def _apply_sample(
         self,
@@ -1867,8 +1901,19 @@ class DataManager(QObject):
         now = float(sample.get("timestamp") or time.time())
         was_online = node.online
         raw_presence_score = _score(sample.get("presence_score", sample.get("presence")))
+        startup_demo_presence = self._startup_demo_presence(
+            node_id,
+            incoming_source,
+            was_online=was_online,
+            seq=_optional_int(sample.get("seq")),
+        )
         mobile_presence_score = self._mobile_presence_overrides.get(node_id)
-        presence_score = mobile_presence_score if mobile_presence_score is not None else raw_presence_score
+        if mobile_presence_score is not None:
+            presence_score = mobile_presence_score
+        elif startup_demo_presence is not None:
+            presence_score = startup_demo_presence
+        else:
+            presence_score = raw_presence_score
         label = str(sample.get("node_label") or "").strip()
         if label:
             node.label = label
@@ -1898,6 +1943,8 @@ class DataManager(QObject):
         source = incoming_source
         if mobile_presence_score is not None and source in {"serial_real", "replay"}:
             source = "mobile_override"
+        elif startup_demo_presence is not None and source == "serial_real":
+            source = "demo_mode"
         node.source = source
         if matrix_state is not None:
             self._refresh_matrix_node(matrix_state, now)
@@ -1999,6 +2046,7 @@ class DataManager(QObject):
                 is_online = bool(last is not None and now - float(last) <= OFFLINE_SECONDS)
                 if node.online and not is_online:
                     node.online = False
+                    self._startup_presence_demo_started_at.pop(node.node_id, None)
                     self._dirty = True
                 if not is_online and not self._offline_flags[node.node_id]:
                     self._offline_flags[node.node_id] = True
@@ -2493,6 +2541,15 @@ class DataManager(QObject):
                     "recording_active": self._recorder.active,
                     "replay_active": self._replay_timer.isActive(),
                     "mobile_override_active": bool(self._mobile_presence_overrides),
+                    "startup_presence_demo_active": bool(
+                        self.startup_presence_demo_seconds > 0.0
+                        and any(
+                            node.online
+                            and node.source == "demo_mode"
+                            and node.node_id in self._startup_presence_demo_started_at
+                            for node in self.nodes.values()
+                        )
+                    ),
                 },
             }
         )

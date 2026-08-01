@@ -8,6 +8,8 @@
 - `build_upper_computer_mobile_v033.ps1`：构建无密码手机演示控制版，共用同一核心版本。
 - `package_releases.ps1`：运行全部测试、构建两个发行版、生成 ZIP 和 `SHA256SUMS.txt`。
 
+发行脚本只运行 Git 已跟踪的正式测试，并检查 Python、PyInstaller 的退出码；任一步骤失败都会停止，不会继续生成可误认为成功的发行包。
+
 v0.3.3 正式产物：
 
 ```text
