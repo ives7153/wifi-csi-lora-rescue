@@ -120,6 +120,62 @@ def _knn_inside_probability(
     return votes.get("inside", 0.0) / total, neighbours[0][0], predicted
 
 
+def _fit_feature_space(
+    rows: list[list[float]],
+    labels: list[str],
+    *,
+    maximum_features: int = 24,
+) -> tuple[list[float], list[float], list[int]]:
+    """仅用给定训练集拟合稳健缩放与 Fisher 特征选择。"""
+
+    if not rows or len(rows) != len(labels):
+        raise CalibrationError("区域特征训练集为空或标签不一致")
+    width = len(rows[0])
+    if width == 0 or any(len(row) != width for row in rows):
+        raise CalibrationError("区域特征维度不一致")
+
+    medians: list[float] = []
+    scales: list[float] = []
+    for index in range(width):
+        column = [row[index] for row in rows]
+        median = _median(column)
+        mad = _median([abs(value - median) for value in column])
+        medians.append(median)
+        scales.append(max(0.01, mad * 1.4826))
+
+    fisher_scores: list[tuple[float, int]] = []
+    for index in range(width):
+        class_means: list[float] = []
+        within = 0.0
+        for label in PHASE_ORDER:
+            values = [row[index] for row, row_label in zip(rows, labels, strict=False) if row_label == label]
+            if not values:
+                raise CalibrationError(f"{PHASE_LABELS[label]}训练样本为空")
+            mean = sum(values) / len(values)
+            class_means.append(mean)
+            within += sum((value - mean) ** 2 for value in values) / len(values)
+        grand = sum(class_means) / len(class_means)
+        between = sum((value - grand) ** 2 for value in class_means)
+        fisher_scores.append((between / max(1e-8, within), index))
+    selected = [
+        index
+        for _, index in sorted(fisher_scores, reverse=True)[: min(maximum_features, width)]
+    ]
+    return medians, scales, selected
+
+
+def _transform_with_feature_space(
+    row: list[float],
+    medians: list[float],
+    scales: list[float],
+    selected: list[int],
+) -> list[float]:
+    return [
+        max(-8.0, min(8.0, (row[index] - medians[index]) / scales[index]))
+        for index in selected
+    ]
+
+
 class TriangleRegionDetector:
     """组装九条链路、执行现场标定并输出带迟滞的全局区域状态。"""
 
@@ -405,47 +461,19 @@ class TriangleRegionDetector:
     def _train_and_save(self) -> None:
         raw_rows: list[list[float]] = []
         raw_labels: list[str] = []
-        sampled_by_class: dict[str, list[list[float]]] = {}
         for label in PHASE_ORDER:
             rows = _downsample(self.samples[label])
             if len(rows) < MIN_PHASE_SAMPLES[label]:
                 raise CalibrationError(f"{PHASE_LABELS[label]}有效样本不足")
-            sampled_by_class[label] = rows
             raw_rows.extend(rows)
             raw_labels.extend([label] * len(rows))
-        width = len(raw_rows[0])
-        if width == 0 or any(len(row) != width for row in raw_rows):
-            raise CalibrationError("区域特征维度不一致")
-
-        medians: list[float] = []
-        scales: list[float] = []
-        for index in range(width):
-            column = [row[index] for row in raw_rows]
-            median = _median(column)
-            mad = _median([abs(value - median) for value in column])
-            medians.append(median)
-            scales.append(max(0.01, mad * 1.4826))
-
-        fisher_scores: list[tuple[float, int]] = []
-        for index in range(width):
-            class_means = []
-            within = 0.0
-            for label in PHASE_ORDER:
-                values = [row[index] for row in sampled_by_class[label]]
-                mean = sum(values) / len(values)
-                class_means.append(mean)
-                within += sum((value - mean) ** 2 for value in values) / len(values)
-            grand = sum(class_means) / len(class_means)
-            between = sum((value - grand) ** 2 for value in class_means)
-            fisher_scores.append((between / max(1e-8, within), index))
-        selected = [index for _, index in sorted(fisher_scores, reverse=True)[: min(24, width)]]
-
+        medians, scales, selected = _fit_feature_space(raw_rows, raw_labels)
         transformed = [
-            [max(-8.0, min(8.0, (row[index] - medians[index]) / scales[index])) for index in selected]
+            _transform_with_feature_space(row, medians, scales, selected)
             for row in raw_rows
         ]
-        probabilities: list[float] = []
-        predictions: list[str] = []
+        probabilities = [0.0] * len(raw_rows)
+        predictions = ["unknown"] * len(raw_rows)
         folds: list[int] = []
         class_offsets = {label: 0 for label in PHASE_ORDER}
         class_counts = {label: raw_labels.count(label) for label in PHASE_ORDER}
@@ -454,12 +482,27 @@ class TriangleRegionDetector:
             count = class_counts[label]
             folds.append(min(4, int(offset * 5 / max(1, count))))
             class_offsets[label] += 1
-        for index, vector in enumerate(transformed):
-            train_vectors = [row for j, row in enumerate(transformed) if folds[j] != folds[index]]
-            train_labels = [label for j, label in enumerate(raw_labels) if folds[j] != folds[index]]
-            probability, _, predicted = _knn_inside_probability(vector, train_vectors, train_labels)
-            probabilities.append(probability)
-            predictions.append(predicted)
+        # 五段连续块交叉验证。每折的缩放参数和特征选择只用训练段拟合，
+        # 避免验证段信息泄漏并高估现场检出率。
+        for fold in range(5):
+            train_indices = [index for index, value in enumerate(folds) if value != fold]
+            validation_indices = [index for index, value in enumerate(folds) if value == fold]
+            fold_rows = [raw_rows[index] for index in train_indices]
+            fold_labels = [raw_labels[index] for index in train_indices]
+            fold_medians, fold_scales, fold_selected = _fit_feature_space(fold_rows, fold_labels)
+            train_vectors = [
+                _transform_with_feature_space(raw_rows[index], fold_medians, fold_scales, fold_selected)
+                for index in train_indices
+            ]
+            for index in validation_indices:
+                vector = _transform_with_feature_space(
+                    raw_rows[index], fold_medians, fold_scales, fold_selected
+                )
+                probability, _, predicted = _knn_inside_probability(
+                    vector, train_vectors, fold_labels
+                )
+                probabilities[index] = probability
+                predictions[index] = predicted
 
         best: tuple[float, float, float] | None = None
         for integer in range(30, 96):
@@ -488,6 +531,7 @@ class TriangleRegionDetector:
             "outside_false_positive": false_positive,
             "inside_threshold": threshold,
             "sample_count": float(len(raw_rows)),
+            "cv_folds": 5.0,
         }
         self.validation_metrics = metrics
         if recall < 0.95:

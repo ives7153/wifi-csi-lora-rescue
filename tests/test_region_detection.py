@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from PyQt6.QtCore import QCoreApplication
 
+from upper_computer import region_detection as region_module
 from upper_computer.core.data_manager import DataManager
 from upper_computer.data_parser import parse_gateway_frame
 from upper_computer.region_detection import (
@@ -121,7 +122,14 @@ class RegionDetectionTests(unittest.TestCase):
                 {"empty": 10, "inside": 10, "outside": 10},
                 clear=True,
             ):
-                detector._train_and_save()
+                with patch.object(
+                    region_module,
+                    "_fit_feature_space",
+                    wraps=region_module._fit_feature_space,
+                ) as fit_feature_space:
+                    detector._train_and_save()
+            # 最终模型拟合一次，每个连续验证折单独拟合一次，验证段不参与参数估计。
+            self.assertEqual(fit_feature_space.call_count, 6)
 
             self.assertTrue(profile_path.exists())
             loaded = TriangleRegionDetector(profile_path)
@@ -130,6 +138,7 @@ class RegionDetectionTests(unittest.TestCase):
         self.assertIsNotNone(loaded.profile)
         self.assertGreaterEqual(detector.validation_metrics["inside_recall"], 0.95)
         self.assertLessEqual(detector.validation_metrics["outside_false_positive"], 0.05)
+        self.assertEqual(detector.validation_metrics["cv_folds"], 5.0)
 
     def test_two_inside_and_three_outside_windows_apply_hysteresis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
