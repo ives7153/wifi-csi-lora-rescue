@@ -10,8 +10,8 @@ jobs:
   upper-computer:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: pip
@@ -33,9 +33,10 @@ jobs:
       matrix:
         target: [gateway, node]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build ESP32-S3 firmware
         shell: bash
         run: |
+          source /opt/esp/idf/export.sh
           cd "firmware/${{ matrix.target }}"
-          idf.py build
+          python "$IDF_PATH/tools/idf.py" build
