@@ -1,4 +1,4 @@
-"""PyInstaller entrypoint for EchoGuard Mobile v0.3.3."""
+"""PyInstaller entrypoint for EchoGuard Mobile."""
 
 from upper_computer.mobile_control_main import main
 

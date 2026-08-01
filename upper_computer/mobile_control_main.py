@@ -1,4 +1,4 @@
-"""EchoGuard Mobile v0.3.3 手机热点控制版入口。"""
+"""EchoGuard Mobile 手机热点控制版入口。"""
 
 from __future__ import annotations
 
@@ -86,6 +86,8 @@ def main() -> int:
     window.ai_action_requested.connect(manager.handle_ai_action)
     window.recording_toggled.connect(manager.set_recording_enabled)
     window.replay_requested.connect(manager.replay_recording)
+    window.region_calibration_phase_requested.connect(manager.start_region_calibration_phase)
+    window.region_calibration_cancel_requested.connect(manager.cancel_region_calibration)
 
     panel.node_presence_changed.connect(manager.set_mobile_presence)
     panel.restore_node_requested.connect(manager.clear_mobile_presence)

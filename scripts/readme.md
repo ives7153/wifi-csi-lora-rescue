@@ -10,13 +10,13 @@
 
 发行脚本只运行 Git 已跟踪的正式测试，并检查 Python、PyInstaller 的退出码；任一步骤失败都会停止，不会继续生成可误认为成功的发行包。
 
-v0.3.3 正式产物：
+v0.4.0 正式产物：
 
 ```text
-dist/EchoGuard-v0.3.3-windows/
-dist/EchoGuard-Mobile-v0.3.3-windows/
-releases/EchoGuard-v0.3.3-windows.zip
-releases/EchoGuard-Mobile-v0.3.3-windows.zip
+dist/EchoGuard-v0.4.0-windows/
+dist/EchoGuard-Mobile-v0.4.0-windows/
+releases/EchoGuard-v0.4.0-windows.zip
+releases/EchoGuard-Mobile-v0.4.0-windows.zip
 ```
 
 ## 使用建议

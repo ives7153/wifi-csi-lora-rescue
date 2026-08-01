@@ -9,6 +9,7 @@
 - 节点是否存在，以 Gateway 收到该节点 LoRa 帧并通过 USB 串口输出有效 JSON 为准。
 - 实时主判断由多节点规则融合完成，AI 只做异步辅助解释，不接管实时判断。
 - Mobile 演示覆盖和文件回放必须携带明确数据来源，不伪装成实时 Gateway 数据。
+- 三角形区域检测只接受 GW-02 实时 `csi_features` 帧；Mobile 覆盖、启动演示和录制回放均不得驱动区域状态。
 
 ## 固件到上位机的数据链路
 
@@ -50,7 +51,7 @@ Gateway 每 10 秒额外输出一条状态 JSON，用于链路诊断，不会创
 {
   "type": "gateway_status",
   "protocol": 1,
-  "firmware": "v0.3.3",
+  "firmware": "v0.4.0",
   "gateway_id": "GW-01",
   "ssid": "EchoGuard-GW-01",
   "uptime_ms": 10000,
@@ -63,6 +64,27 @@ Gateway 每 10 秒额外输出一条状态 JSON，用于链路诊断，不会创
   "wifi_clients": 3
 }
 ```
+
+GW-02 区域模式还会转发独立的 CSI 特征 JSON。每个 Node 帧包含本机 STA MAC 和 3 条接收链路；三节点合计覆盖 3 条 Gateway→Node 链路与 6 条有方向的 Node→Node 链路：
+
+```json
+{
+  "type": "csi_features",
+  "v": 1,
+  "gateway_id": "GW-02",
+  "node": 1,
+  "node_mac": "02:00:00:00:00:01",
+  "seq": 7,
+  "flags": 3,
+  "links": [
+    {"src": 0, "valid": true, "n": 16, "rssi": -55, "rssi_std": 4,
+     "active": 20, "corr": 3, "mad": [1,2,3,4,5,6,7,8],
+     "diff": [1,2,3,4,5,6,7,8]}
+  ]
+}
+```
+
+`data_parser.py` 将短字段规范化为 `source_id/sample_count/active_ratio/correlation_delta/mad_bands/diff_bands`。`DataManager` 将该帧直接送入 `TriangleRegionDetector`，不创建普通节点、不写入节点历史，也不执行原 presence 报警规则。
 
 上位机 `data_parser.py` 将这些字段规范化为内部字段，例如：
 

@@ -11,6 +11,8 @@ idf_component_register(
         esp_timer
         echoguard_protocol
         echoguard_lora
+        echoguard_region
+        region_csi
         sensors
         wifi_manager
 )

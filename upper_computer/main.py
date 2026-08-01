@@ -79,6 +79,8 @@ def main() -> int:
     window.ai_action_requested.connect(manager.handle_ai_action)
     window.recording_toggled.connect(manager.set_recording_enabled)
     window.replay_requested.connect(manager.replay_recording)
+    window.region_calibration_phase_requested.connect(manager.start_region_calibration_phase)
+    window.region_calibration_cancel_requested.connect(manager.cancel_region_calibration)
 
     # ---------------- DataManager -> UI ----------------
     manager.ports_changed.connect(window.update_ports)

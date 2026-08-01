@@ -302,7 +302,7 @@ class MobileControlService(QObject):
         service = self
 
         class MobileRequestHandler(BaseHTTPRequestHandler):
-            server_version = "EchoGuardMobile/0.3.3"
+            server_version = f"EchoGuardMobile/{DISPLAY_VERSION.lstrip('v')}"
 
             def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
                 path = urlsplit(self.path).path

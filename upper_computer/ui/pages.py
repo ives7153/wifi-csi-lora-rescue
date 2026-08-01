@@ -678,6 +678,119 @@ class AISettingsDialog(QDialog):
 # ===========================================================================
 # 仪表盘页（图 2）
 # ===========================================================================
+class RegionCalibrationDialog(QDialog):
+    """GW-02 三角形区域三阶段现场标定向导。"""
+
+    phase_requested = pyqtSignal(str)
+    cancel_requested = pyqtSignal()
+
+    _PHASES = (
+        ("empty", "1. 空场 60 秒", "区域内外均保持无人，不要在节点附近走动。"),
+        ("inside", "2. 内部 180 秒", "一人在三角形内部持续自然走动，避开边线 30 cm 过渡带。"),
+        ("outside", "3. 外部 180 秒", "一人在三角形外部持续走动，避开边线外 30 cm 过渡带。"),
+    )
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("三角形区域标定 · GW-02")
+        self.setModal(False)
+        self.resize(620, 430)
+        self.setMinimumSize(560, 390)
+        self._buttons: dict[str, QPushButton] = {}
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(14)
+        title = QLabel("三角形区域现场标定")
+        title.setObjectName("PageTitle")
+        intro = QLabel(
+            "仅使用 GW-02 和 Node 1/2/3 的真实九链路 CSI。请按顺序完成三阶段；"
+            "标定期间手机演示值不会参与区域判定。"
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("SubtleText")
+        layout.addWidget(title)
+        layout.addWidget(intro)
+
+        self.status_label = QLabel("等待九链路数据")
+        self.status_label.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 16px; font-weight: 700;")
+        self.progress_label = QLabel("有效链路：0/9")
+        self.progress_label.setObjectName("SubtleText")
+        layout.addWidget(self.status_label)
+        layout.addWidget(self.progress_label)
+
+        for phase, button_text, instruction in self._PHASES:
+            card = CardFrame()
+            row = QHBoxLayout(card)
+            row.setContentsMargins(16, 12, 16, 12)
+            text_box = QVBoxLayout()
+            phase_label = QLabel(button_text)
+            phase_label.setStyleSheet(f"color: {THEME['text']}; font-weight: 700;")
+            hint = QLabel(instruction)
+            hint.setWordWrap(True)
+            hint.setObjectName("SubtleText")
+            text_box.addWidget(phase_label)
+            text_box.addWidget(hint)
+            button = QPushButton("开始")
+            button.setObjectName("PrimaryButton")
+            button.setFixedWidth(92)
+            button.clicked.connect(lambda _checked=False, value=phase: self.phase_requested.emit(value))
+            self._buttons[phase] = button
+            row.addLayout(text_box, 1)
+            row.addWidget(button)
+            layout.addWidget(card)
+
+        footer = QHBoxLayout()
+        self.error_label = QLabel("")
+        self.error_label.setWordWrap(True)
+        self.error_label.setStyleSheet(f"color: {THEME['orange']};")
+        cancel = QPushButton("取消本次标定")
+        cancel.setObjectName("GhostButton")
+        cancel.clicked.connect(self.cancel_requested.emit)
+        close = QPushButton("收起窗口")
+        close.setObjectName("GhostButton")
+        close.clicked.connect(self.hide)
+        footer.addWidget(self.error_label, 1)
+        footer.addWidget(cancel)
+        footer.addWidget(close)
+        layout.addLayout(footer)
+
+    def update_region(self, region: dict[str, Any]) -> None:
+        calibration = region.get("calibration") if isinstance(region.get("calibration"), dict) else {}
+        current = str(calibration.get("phase") or "")
+        completed = {str(value) for value in calibration.get("completed") or []}
+        counts = calibration.get("counts") if isinstance(calibration.get("counts"), dict) else {}
+        remaining = max(0, int(float(calibration.get("remaining_seconds") or 0.0) + 0.999))
+        status = str(region.get("status") or "not_calibrated")
+        valid_links = int(region.get("valid_links") or 0)
+
+        if current:
+            label = str(calibration.get("phase_label") or current)
+            self.status_label.setText(f"正在采集：{label} · 剩余 {remaining} 秒")
+        elif status == "calibration_ready_next":
+            self.status_label.setText("本阶段完成，请按顺序开始下一阶段")
+        elif status == "clear" and len(completed) == 3:
+            self.status_label.setText("标定完成，配置已保存并开始实时判定")
+        else:
+            self.status_label.setText(str(region.get("label") or "等待标定"))
+        self.progress_label.setText(
+            "有效链路：{}/9 · 样本 空场 {} / 内部 {} / 外部 {}".format(
+                valid_links,
+                int(counts.get("empty") or 0),
+                int(counts.get("inside") or 0),
+                int(counts.get("outside") or 0),
+            )
+        )
+        self.error_label.setText(str(calibration.get("error") or ""))
+
+        expected_index = len(completed)
+        order = ("empty", "inside", "outside")
+        for index, phase in enumerate(order):
+            button = self._buttons[phase]
+            button.setText("采集中" if phase == current else "已完成" if phase in completed else "开始")
+            button.setEnabled(not current and index == expected_index and valid_links == 9)
+
+
 class DashboardPage(QWidget):
     """实时生命体征仪表盘。"""
 
@@ -694,6 +807,8 @@ class DashboardPage(QWidget):
     ai_models_requested = pyqtSignal()
     ai_llm_test_requested = pyqtSignal()
     ai_action_requested = pyqtSignal(object)
+    region_calibration_phase_requested = pyqtSignal(str)
+    region_calibration_cancel_requested = pyqtSignal()
 
     _VERDICT_PRIORITY = {
         "等待数据": 0,
@@ -733,6 +848,8 @@ class DashboardPage(QWidget):
         self._verdict_chips: dict[str, QLabel] = {}
         self._last_pause_text = ""
         self._last_group_values: dict[str, tuple[str, str]] = {}
+        self._region_dialog: RegionCalibrationDialog | None = None
+        self._latest_region: dict[str, Any] = {}
 
         body = QHBoxLayout(self)
         body.setContentsMargins(0, 0, 0, 0)
@@ -781,6 +898,34 @@ class DashboardPage(QWidget):
         controls.addWidget(csi_btn)
         controls.addWidget(shot_btn)
         layout.addLayout(controls)
+
+        self.region_card = CardFrame()
+        self.region_card.setFixedHeight(108)
+        region_layout = QHBoxLayout(self.region_card)
+        region_layout.setContentsMargins(18, 12, 18, 12)
+        region_layout.setSpacing(18)
+        region_title_box = QVBoxLayout()
+        region_title = QLabel("三角形区域检测 · GW-02")
+        region_title.setObjectName("SectionTitle")
+        region_hint = QLabel("9 条定向 CSI 链路 · 单人走动 · 边线 ±30 cm 为过渡带")
+        region_hint.setObjectName("SubtleText")
+        region_title_box.addWidget(region_title)
+        region_title_box.addWidget(region_hint)
+        self.region_status = QLabel("未标定")
+        self.region_status.setObjectName("MetricValue")
+        self.region_detail = QLabel("等待 GW-02 与三个节点的完整特征")
+        self.region_detail.setObjectName("SubtleText")
+        self.region_detail.setWordWrap(True)
+        region_status_box = QVBoxLayout()
+        region_status_box.addWidget(self.region_status)
+        region_status_box.addWidget(self.region_detail)
+        region_button = QPushButton("区域标定")
+        region_button.setObjectName("PrimaryButton")
+        region_button.clicked.connect(self._show_region_calibration)
+        region_layout.addLayout(region_title_box, 2)
+        region_layout.addLayout(region_status_box, 2)
+        region_layout.addWidget(region_button)
+        layout.addWidget(self.region_card)
 
         self.verdict_card = CardFrame()
         self.verdict_card.setFixedHeight(156)
@@ -968,6 +1113,8 @@ class DashboardPage(QWidget):
         self._latest_ai_config = dict(ai_state.get("config") or {})
         if self._ai_dialog is not None:
             self._ai_dialog.set_runtime_state(ai_state)
+        region = snapshot.get("region") if isinstance(snapshot.get("region"), dict) else {}
+        self._update_region_status(region)
 
         self._paused = bool(snapshot.get("paused"))
         pause_text = "恢复刷新" if self._paused else "暂停刷新"
@@ -1007,6 +1154,44 @@ class DashboardPage(QWidget):
             nodes,
             _float(config.get("presence_threshold"), PRESENCE_THRESHOLD),
         )
+
+    def _show_region_calibration(self) -> None:
+        if self._region_dialog is None:
+            self._region_dialog = RegionCalibrationDialog(self.window())
+            self._region_dialog.phase_requested.connect(self.region_calibration_phase_requested.emit)
+            self._region_dialog.cancel_requested.connect(self.region_calibration_cancel_requested.emit)
+        self._region_dialog.update_region(self._latest_region)
+        self._region_dialog.show()
+        self._region_dialog.raise_()
+        self._region_dialog.activateWindow()
+
+    def _update_region_status(self, region: dict[str, Any]) -> None:
+        self._latest_region = dict(region)
+        status = str(region.get("status") or "not_calibrated")
+        label = str(region.get("label") or "未标定")
+        links = int(region.get("valid_links") or 0)
+        probability = max(0.0, min(float(region.get("inside_probability") or 0.0), 1.0))
+        calibration = region.get("calibration") if isinstance(region.get("calibration"), dict) else {}
+        if status == "calibrating":
+            detail = f"{calibration.get('phase_label') or '现场'}采集中 · 有效链路 {links}/9"
+            color = THEME["orange"]
+        elif status == "occupied":
+            detail = f"内部概率 {probability * 100:.0f}% · 有效链路 {links}/9"
+            color = THEME["red"]
+        elif status == "clear":
+            detail = f"内部概率 {probability * 100:.0f}% · 有效链路 {links}/9"
+            color = THEME["green"]
+        elif status in {"calibration_failed", "profile_mismatch", "needs_recalibration", "gateway_mismatch"}:
+            detail = str(calibration.get("error") or f"有效链路 {links}/9，请检查设备或重新标定")
+            color = THEME["red"]
+        else:
+            detail = f"有效链路 {links}/9 · 需要 GW-02 与 Node 1/2/3"
+            color = THEME["blue_soft"]
+        self.region_status.setText(label)
+        self.region_status.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: 800;")
+        self.region_detail.setText(detail)
+        if self._region_dialog is not None:
+            self._region_dialog.update_region(region)
 
     def _toggle_pause(self) -> None:
         self._paused = not self._paused

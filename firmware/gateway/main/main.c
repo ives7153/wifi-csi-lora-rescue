@@ -1,6 +1,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -15,6 +16,7 @@
 #include "esp_wifi.h"
 #include "echoguard_protocol.h"
 #include "echoguard_lora.h"
+#include "echoguard_region_protocol.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/queue.h"
@@ -36,7 +38,7 @@
 #define WIFI_SOFTAP_SSID          CONFIG_ECHOGUARD_GATEWAY_SSID
 #define WIFI_SOFTAP_PASSWORD      CONFIG_ECHOGUARD_WIFI_PASSWORD
 #define GATEWAY_ID                CONFIG_ECHOGUARD_GATEWAY_ID
-#define GATEWAY_FIRMWARE_VERSION  "v0.3.3"
+#define GATEWAY_FIRMWARE_VERSION  "v0.4.0"
 #define WIFI_SOFTAP_CHANNEL       6
 #define WIFI_SOFTAP_MAX_CONN      4
 
@@ -62,10 +64,11 @@
 #define LORA_TASK_STACK_SIZE      4096
 #define SERIAL_TASK_STACK_SIZE    4096
 #define UDP_KEEPALIVE_TASK_STACK_SIZE 4096
+#define REGION_RX_TASK_STACK_SIZE 4096
 
 /* Gateway 主动给 SoftAP 在线节点发 UDP 小包，制造稳定 WiFi 下行帧用于节点 CSI 采样。 */
 #define UDP_KEEPALIVE_PORT        33333
-#define UDP_KEEPALIVE_INTERVAL_MS 100
+#define UDP_KEEPALIVE_INTERVAL_MS 20
 
 #define WIFI_AP_STARTED_BIT       BIT0
 
@@ -116,10 +119,16 @@ typedef struct {
     int64_t ts_ms;
 } rescue_lora_packet_t;
 
+typedef struct {
+    echoguard_region_packet_t packet;
+    int64_t received_ms;
+} region_rx_packet_t;
+
 static const char *TAG = "rescue_gateway";
 
 static EventGroupHandle_t s_wifi_event_group;
 static QueueHandle_t s_lora_queue;
+static QueueHandle_t s_region_queue;
 static spi_device_handle_t s_lora_spi;
 static esp_netif_t *s_softap_netif;
 static volatile uint32_t s_lora_rx_ok;
@@ -127,9 +136,13 @@ static volatile uint32_t s_lora_crc_errors;
 static volatile uint32_t s_lora_bad_length;
 static volatile uint32_t s_lora_parse_errors;
 static volatile uint32_t s_lora_queue_drops;
+static volatile uint32_t s_region_rx_ok;
+static volatile uint32_t s_region_rx_invalid;
+static volatile uint32_t s_region_queue_drops;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void udp_keepalive_task(void *arg);
+static void region_feature_receive_task(void *arg);
 static esp_err_t lora_spi_bus_init_once(void);
 static esp_err_t lora_chip_configure(void);
 static void lora_set_op_mode(uint8_t mode);
@@ -138,6 +151,8 @@ static uint8_t lora_read_reg(uint8_t reg);
 static bool lora_receive_once(rescue_lora_packet_t *packet);
 static bool parse_lora_payload(const uint8_t *payload, size_t len, rescue_lora_packet_t *packet);
 static void gateway_print_status(void);
+static bool format_region_json(const region_rx_packet_t *received, char *output, size_t capacity);
+static size_t append_format(char *output, size_t capacity, size_t offset, const char *format, ...);
 
 /* 串口初始化：ESP32-S3 USB Serial/JTAG 由 sdkconfig.defaults 选择，stdio 直接输出到上位机。 */
 static void serial_console_init(void)
@@ -180,6 +195,7 @@ static void wifi_softap_task(void *arg)
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20));
     xEventGroupSetBits(s_wifi_event_group, WIFI_AP_STARTED_BIT);
 
     ESP_LOGI(TAG, "SoftAP started, ssid=%s, channel=%d, auth=WPA2-PSK",
@@ -249,6 +265,11 @@ static void udp_keepalive_task(void *arg)
                     pair_count = WIFI_SOFTAP_MAX_CONN;
                 }
 
+                uint32_t cycle_seq = seq++;
+                uint8_t slot = (uint8_t)(cycle_seq % 3U) + 1U;
+                char payload[32] = {0};
+                int payload_len = snprintf(payload, sizeof(payload),
+                                           "EGSYNC:%" PRIu32 ":%u", cycle_seq, slot);
                 for (int i = 0; i < pair_count; ++i) {
                     memcpy(mac_ip_pairs[i].mac, wifi_sta_list.sta[i].mac, sizeof(mac_ip_pairs[i].mac));
                 }
@@ -273,8 +294,6 @@ static void udp_keepalive_task(void *arg)
                         .sin_port = htons(UDP_KEEPALIVE_PORT),
                         .sin_addr.s_addr = ip_addr,
                     };
-                    char payload[24] = {0};
-                    int payload_len = snprintf(payload, sizeof(payload), "EGCSI:%" PRIu32, seq++);
                     int sent = sendto(sock, payload, payload_len, 0,
                                       (struct sockaddr *)&dest, sizeof(dest));
                     if (sent < 0 && (warn_throttle++ % 50U) == 0U) {
@@ -289,6 +308,70 @@ static void udp_keepalive_task(void *arg)
 
             vTaskDelay(pdMS_TO_TICKS(UDP_KEEPALIVE_INTERVAL_MS));
         }
+    }
+}
+
+/* Node 的多链路 CSI 特征通过 WiFi UDP 上行，避免占用 LoRa 空口。 */
+static void region_feature_receive_task(void *arg)
+{
+    (void)arg;
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_AP_STARTED_BIT,
+                        pdFALSE, pdTRUE, portMAX_DELAY);
+
+    while (true) {
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGW(TAG, "region UDP socket create failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        struct sockaddr_in local_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(ECHOGUARD_REGION_FEATURE_PORT),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        if (bind(sock, (struct sockaddr *)&local_addr, sizeof(local_addr)) < 0) {
+            ESP_LOGW(TAG, "region UDP bind failed: errno=%d", errno);
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        struct timeval timeout = {.tv_sec = 1, .tv_usec = 0};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+        ESP_LOGI(TAG, "triangle region UDP receiver ready: port=%u packet_len=%u",
+                 ECHOGUARD_REGION_FEATURE_PORT, ECHOGUARD_REGION_PACKET_LEN);
+
+        while (true) {
+            uint8_t payload[ECHOGUARD_REGION_PACKET_LEN + 1U] = {0};
+            struct sockaddr_in source = {0};
+            socklen_t source_len = sizeof(source);
+            int length = recvfrom(sock, payload, sizeof(payload), 0,
+                                  (struct sockaddr *)&source, &source_len);
+            if (length < 0) {
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    continue;
+                }
+                ESP_LOGW(TAG, "region UDP receive failed: errno=%d", errno);
+                break;
+            }
+
+            region_rx_packet_t received = {.received_ms = esp_timer_get_time() / 1000};
+            if (!echoguard_region_packet_decode(payload, (size_t)length, &received.packet)) {
+                s_region_rx_invalid++;
+                if ((s_region_rx_invalid % 20U) == 1U) {
+                    ESP_LOGW(TAG, "invalid region feature packet len=%d from=" IPSTR,
+                             length, IP2STR((esp_ip4_addr_t *)&source.sin_addr));
+                }
+                continue;
+            }
+            s_region_rx_ok++;
+            if (xQueueSend(s_region_queue, &received, 0) != pdTRUE) {
+                s_region_queue_drops++;
+            }
+        }
+        close(sock);
     }
 }
 
@@ -324,7 +407,7 @@ static void lora_receive_task(void *arg)
     }
 }
 
-/* 串口转发任务：只把 LoRa 数据帧转成 JSON Lines，便于 Python 上位机按行解析。 */
+/* 串口转发任务：统一输出 LoRa 节点数据与区域特征 JSON Lines。 */
 static void serial_forward_task(void *arg)
 {
     (void)arg;
@@ -332,7 +415,7 @@ static void serial_forward_task(void *arg)
     int64_t last_status_ms = -10000;
     while (true) {
         rescue_lora_packet_t packet = {0};
-        if (xQueueReceive(s_lora_queue, &packet, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        if (xQueueReceive(s_lora_queue, &packet, pdMS_TO_TICKS(100)) == pdTRUE) {
             printf("{\"id\":%u,\"seq\":%" PRIu32 ",\"presence\":%u,\"motion\":%u,"
                    "\"bpm\":%u,\"conf\":%u,\"gas\":%u,\"temp\":%.1f,"
                    "\"hum\":%u,\"rssi\":%d,\"ts\":%" PRId64 "}\n",
@@ -350,12 +433,90 @@ static void serial_forward_task(void *arg)
             fflush(stdout);
         }
 
+        region_rx_packet_t region = {0};
+        while (xQueueReceive(s_region_queue, &region, 0) == pdTRUE) {
+            char json_line[1536] = {0};
+            if (format_region_json(&region, json_line, sizeof(json_line))) {
+                printf("%s\n", json_line);
+                fflush(stdout);
+            }
+        }
+
         int64_t now_ms = esp_timer_get_time() / 1000;
         if (now_ms - last_status_ms >= 10000) {
             last_status_ms = now_ms;
             gateway_print_status();
         }
     }
+}
+
+static size_t append_format(
+    char *output,
+    size_t capacity,
+    size_t offset,
+    const char *format,
+    ...
+)
+{
+    if (output == NULL || format == NULL || offset >= capacity) {
+        return capacity;
+    }
+    va_list args;
+    va_start(args, format);
+    int written = vsnprintf(output + offset, capacity - offset, format, args);
+    va_end(args);
+    if (written < 0 || (size_t)written >= capacity - offset) {
+        return capacity;
+    }
+    return offset + (size_t)written;
+}
+
+static bool format_region_json(
+    const region_rx_packet_t *received,
+    char *output,
+    size_t capacity
+)
+{
+    if (received == NULL || output == NULL || capacity == 0U) {
+        return false;
+    }
+    const echoguard_region_packet_t *packet = &received->packet;
+    size_t offset = append_format(
+        output, capacity, 0U,
+        "{\"type\":\"csi_features\",\"v\":%u,\"gateway_id\":\"%s\"," \
+        "\"node\":%u,\"node_mac\":\"%02x:%02x:%02x:%02x:%02x:%02x\"," \
+        "\"seq\":%" PRIu32 ",\"epoch_ms\":%" PRIu32 "," \
+        "\"flags\":%u,\"links\":[",
+        ECHOGUARD_REGION_PROTOCOL_VERSION, GATEWAY_ID, packet->node_id,
+        packet->node_mac[0], packet->node_mac[1], packet->node_mac[2],
+        packet->node_mac[3], packet->node_mac[4], packet->node_mac[5],
+        packet->sequence, packet->epoch_ms, packet->flags
+    );
+    for (uint8_t i = 0U; i < packet->link_count && offset < capacity; ++i) {
+        const echoguard_region_link_t *link = &packet->links[i];
+        offset = append_format(
+            output, capacity, offset,
+            "%s{\"src\":%u,\"valid\":%s,\"n\":%u,\"rssi\":%d," \
+            "\"rssi_std\":%u,\"active\":%u,\"corr\":%u,\"mad\":[",
+            i == 0U ? "" : ",", link->source_id,
+            (link->flags & ECHOGUARD_REGION_LINK_FLAG_VALID) != 0U ? "true" : "false",
+            link->sample_count, link->rssi_mean, link->rssi_std,
+            link->active_ratio, link->correlation_delta
+        );
+        for (uint8_t band = 0U; band < ECHOGUARD_REGION_BAND_COUNT; ++band) {
+            offset = append_format(output, capacity, offset, "%s%u",
+                                   band == 0U ? "" : ",", link->mad_bands[band]);
+        }
+        offset = append_format(output, capacity, offset, "],\"diff\":[");
+        for (uint8_t band = 0U; band < ECHOGUARD_REGION_BAND_COUNT; ++band) {
+            offset = append_format(output, capacity, offset, "%s%u",
+                                   band == 0U ? "" : ",", link->diff_bands[band]);
+        }
+        offset = append_format(output, capacity, offset, "]}");
+    }
+    offset = append_format(output, capacity, offset,
+                           "],\"ts\":%" PRId64 "}", received->received_ms);
+    return offset < capacity;
 }
 
 static void gateway_print_status(void)
@@ -369,7 +530,9 @@ static void gateway_print_status(void)
            "\"gateway_id\":\"%s\",\"ssid\":\"%s\",\"uptime_ms\":%" PRId64 ","
            "\"rx_ok\":%" PRIu32 ",\"crc_errors\":%" PRIu32 ","
            "\"bad_length\":%" PRIu32 ",\"parse_errors\":%" PRIu32 ","
-           "\"queue_drops\":%" PRIu32 ",\"queue_depth\":%u,\"wifi_clients\":%u}\n",
+           "\"queue_drops\":%" PRIu32 ",\"queue_depth\":%u,\"wifi_clients\":%u," \
+           "\"region_protocol\":%u,\"region_rx_ok\":%" PRIu32 "," \
+           "\"region_invalid\":%" PRIu32 ",\"region_queue_drops\":%" PRIu32 "}\n",
            ECHOGUARD_PROTOCOL_VERSION,
            GATEWAY_FIRMWARE_VERSION,
            GATEWAY_ID,
@@ -381,7 +544,11 @@ static void gateway_print_status(void)
            s_lora_parse_errors,
            s_lora_queue_drops,
            (unsigned)uxQueueMessagesWaiting(s_lora_queue),
-           (unsigned)client_count);
+           (unsigned)client_count,
+           ECHOGUARD_REGION_PROTOCOL_VERSION,
+           s_region_rx_ok,
+           s_region_rx_invalid,
+           s_region_queue_drops);
     fflush(stdout);
 }
 
@@ -399,13 +566,14 @@ static void nvs_init_for_wifi(void)
 void app_main(void)
 {
     serial_console_init();
-    ESP_LOGI(TAG, "ESP32-S3 LoRa rescue gateway starting");
+    ESP_LOGI(TAG, "EchoGuard Gateway v0.4.0 LoRa + triangle region bridge starting");
 
     nvs_init_for_wifi();
 
     s_wifi_event_group = xEventGroupCreate();
     s_lora_queue = xQueueCreate(LORA_QUEUE_LENGTH, sizeof(rescue_lora_packet_t));
-    if (s_wifi_event_group == NULL || s_lora_queue == NULL) {
+    s_region_queue = xQueueCreate(LORA_QUEUE_LENGTH, sizeof(region_rx_packet_t));
+    if (s_wifi_event_group == NULL || s_lora_queue == NULL || s_region_queue == NULL) {
         ESP_LOGE(TAG, "Failed to create WiFi event group or LoRa packet queue");
         return;
     }
@@ -417,10 +585,12 @@ void app_main(void)
     BaseType_t lora_task_ok = xTaskCreate(lora_receive_task, "lora_receive", LORA_TASK_STACK_SIZE,
                                           NULL, 6, NULL);
     BaseType_t serial_task_ok = xTaskCreate(serial_forward_task, "serial_forward",
-                                            SERIAL_TASK_STACK_SIZE, NULL, 5, NULL);
+                                            SERIAL_TASK_STACK_SIZE + 2048, NULL, 5, NULL);
+    BaseType_t region_task_ok = xTaskCreate(region_feature_receive_task, "region_receive",
+                                            REGION_RX_TASK_STACK_SIZE, NULL, 5, NULL);
 
     if (wifi_task_ok != pdPASS || udp_task_ok != pdPASS ||
-        lora_task_ok != pdPASS || serial_task_ok != pdPASS) {
+        lora_task_ok != pdPASS || serial_task_ok != pdPASS || region_task_ok != pdPASS) {
         ESP_LOGE(TAG, "Failed to create one or more gateway tasks");
     }
 }

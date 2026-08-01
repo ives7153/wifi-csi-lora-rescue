@@ -15,7 +15,7 @@ class GatewayStatusTests(unittest.TestCase):
 
     def test_gateway_status_is_valid_without_creating_a_node(self) -> None:
         raw = (
-            '{"type":"gateway_status","protocol":1,"firmware":"v0.3.3",'
+            '{"type":"gateway_status","protocol":1,"firmware":"v0.4.0",'
             '"gateway_id":"GW-01","ssid":"EchoGuard-GW-01","uptime_ms":1000,'
             '"rx_ok":12,"crc_errors":1,"bad_length":0,"parse_errors":0,'
             '"queue_drops":0,"queue_depth":0,"wifi_clients":2}'

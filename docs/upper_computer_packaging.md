@@ -1,6 +1,6 @@
 # EchoGuard 上位机打包说明
 
-本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。v0.3.3 提供普通监测版和无密码手机演示控制版，两者共用数据、报警、AI、录制回放与导出核心。打包目标不包含 Jina GGUF 模型和 `llama-server.exe`。
+本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。v0.4.0 提供普通监测版和无密码手机演示控制版，两者共用数据、报警、AI、录制回放与导出核心。打包目标不包含 Jina GGUF 模型和 `llama-server.exe`。
 
 ## 打包前检查
 
@@ -37,9 +37,9 @@ python -m PyInstaller --clean --noconfirm EchoGuard.spec
 
 ```text
 dist/
-├── EchoGuard-v0.3.3-windows/
+├── EchoGuard-v0.4.0-windows/
 │   └── EchoGuard.exe
-└── EchoGuard-Mobile-v0.3.3-windows/
+└── EchoGuard-Mobile-v0.4.0-windows/
     └── EchoGuard.exe
 ```
 
@@ -97,8 +97,8 @@ powershell -ExecutionPolicy Bypass -File scripts\package_releases.ps1
 正式分发包命名为：
 
 ```text
-EchoGuard-v0.3.3-windows.zip
-EchoGuard-Mobile-v0.3.3-windows.zip
+EchoGuard-v0.4.0-windows.zip
+EchoGuard-Mobile-v0.4.0-windows.zip
 SHA256SUMS.txt
 ```
 

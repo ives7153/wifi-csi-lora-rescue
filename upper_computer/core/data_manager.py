@@ -50,6 +50,7 @@ try:
         save_ui_settings,
     )
     from ..data_parser import parse_gateway_frame
+    from ..region_detection import CalibrationError, TriangleRegionDetector
     from ..ai import (
         AISettings,
         LocalJinaRuntime,
@@ -113,6 +114,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         save_ui_settings,
     )
     from data_parser import parse_gateway_frame
+    from region_detection import CalibrationError, TriangleRegionDetector
     from ai import (  # type: ignore
         AISettings,
         LocalJinaRuntime,
@@ -388,6 +390,8 @@ class DataManager(QObject):
         self.selected_port = ""
         self.history: list[dict[str, Any]] = []
         self.events: list[EventRecord] = []
+        self.region_detector = TriangleRegionDetector()
+        self._last_region_calibration_publish_at = 0.0
         self.ai_settings: AISettings = load_ai_settings()
         self.ai_runtime = LocalJinaRuntime()
         self.ai_state: dict[str, Any] = {
@@ -457,6 +461,7 @@ class DataManager(QObject):
             "total_invalid": 0,
             "total_dropped": 0,
             "total_gateway_status": 0,
+            "total_csi_features": 0,
         }
         self._gateway_status: dict[str, Any] = {}
         self._dirty = True
@@ -742,7 +747,7 @@ class DataManager(QObject):
                 break
             self._replay_index += 1
             parsed = parse_gateway_frame(record.line)
-            if not parsed.get("valid") or parsed.get("frame_type") == "gateway_status":
+            if not parsed.get("valid") or parsed.get("frame_type") != "node_data":
                 self._replay_invalid_frames += int(not parsed.get("valid"))
                 continue
             parsed["timestamp"] = time.time()
@@ -1481,7 +1486,12 @@ class DataManager(QObject):
                 self.recording_state_changed.emit(False, f"录制写入失败：{exc}")
         all_valid_frames = [frame for frame in frames if isinstance(frame, dict)] if isinstance(frames, list) else []
         status_frames = [frame for frame in all_valid_frames if frame.get("frame_type") == "gateway_status"]
-        valid_frames = [frame for frame in all_valid_frames if frame.get("frame_type") != "gateway_status"]
+        region_frames = [frame for frame in all_valid_frames if frame.get("frame_type") == "csi_features"]
+        valid_frames = [
+            frame
+            for frame in all_valid_frames
+            if frame.get("frame_type", "node_data") == "node_data"
+        ]
         for frame in status_frames:
             payload = frame.get("gateway_status")
             if isinstance(payload, dict):
@@ -1503,12 +1513,32 @@ class DataManager(QObject):
                 "total_invalid": self._serial_stats.get("total_invalid", 0) + invalid,
                 "total_dropped": self._serial_stats.get("total_dropped", 0) + dropped,
                 "total_gateway_status": self._serial_stats.get("total_gateway_status", 0) + len(status_frames),
+                "total_csi_features": self._serial_stats.get("total_csi_features", 0) + len(region_frames),
             }
         )
 
         now = time.time()
+        if region_frames:
+            for frame in region_frames:
+                # 录制回放和手机演示不得驱动真实区域判定；这里只接受串口实时特征。
+                if _canonical_sample_source(frame.get("source")) != "serial_real":
+                    continue
+                if self.region_detector.ingest(frame, now=now):
+                    self._dirty = True
+            self._consume_region_transition(now)
+
         if not valid_frames:
-            if status_frames:
+            if region_frames:
+                self._last_serial_sample_at = now
+                self.status_changed.emit(
+                    f"串口状态：已连接 {self.selected_port or 'Gateway'}，区域 CSI 特征正常",
+                    True,
+                )
+                self._emit_latest_frame(
+                    self._batch_frame_summary(region_frames[-1], total, len(region_frames), invalid, dropped, pending),
+                    now=now,
+                )
+            elif status_frames:
                 gateway_id = str(self._gateway_status.get("gateway_id") or "Gateway")
                 firmware = str(self._gateway_status.get("firmware") or "")
                 self.status_changed.emit(f"串口状态：已连接 {gateway_id} {firmware}，等待节点数据", True)
@@ -1563,6 +1593,50 @@ class DataManager(QObject):
 
         if applied:
             self._dirty = True
+
+    @pyqtSlot(str)
+    def start_region_calibration_phase(self, phase: str) -> None:
+        """开始空场、区域内部或区域外部标定阶段。"""
+
+        try:
+            self.region_detector.start_phase(phase)
+        except CalibrationError as exc:
+            self.export_message_changed.emit(str(exc), False)
+            return
+        phase_label = self.region_detector.snapshot()["calibration"]["phase_label"]
+        self._append_event(
+            "REGION CALIBRATION STARTED",
+            f"{phase_label}采集已开始，请按向导保持现场状态",
+            level="INFO",
+            kind="region",
+        )
+        self.export_message_changed.emit(f"{phase_label}标定已开始", True)
+        self._dirty = True
+
+    @pyqtSlot()
+    def cancel_region_calibration(self) -> None:
+        self.region_detector.cancel_calibration()
+        self._append_event("REGION CALIBRATION CANCELLED", "三角形区域标定已取消", level="WARN", kind="region")
+        self._dirty = True
+
+    def _consume_region_transition(self, event_time: float | None = None) -> None:
+        transition = self.region_detector.consume_transition()
+        if transition == "occupied":
+            self._append_event(
+                "REGION OCCUPIED",
+                "GW-02 三角形区域内检测到走动人员",
+                level="ALARM",
+                kind="region",
+                event_time=event_time,
+            )
+        elif transition == "clear":
+            self._append_event(
+                "REGION CLEAR",
+                "GW-02 三角形区域已恢复无人状态",
+                level="OK",
+                kind="region",
+                event_time=event_time,
+            )
 
     def _emit_latest_frame(self, text: str, now: float | None = None, force: bool = False) -> None:
         """低频更新左侧最新帧，避免 Gateway 高频输出拖慢 QLabel 重排。"""
@@ -2484,6 +2558,17 @@ class DataManager(QObject):
 
     # ------------------------------------------------------------------ 快照
     def _publish_snapshot(self) -> None:
+        if self.region_detector.tick():
+            self._dirty = True
+        now = time.time()
+        if (
+            self.region_detector.current_phase
+            and now - self._last_region_calibration_publish_at >= 1.0
+        ):
+            # 标定窗口需要持续刷新剩余时间和有效样本数。
+            self._dirty = True
+            self._last_region_calibration_publish_at = now
+        self._consume_region_transition()
         if not self._dirty:
             return
 
@@ -2512,6 +2597,7 @@ class DataManager(QObject):
                 "ai": dict(self.ai_state),
                 "serial_stats": dict(self._serial_stats),
                 "gateway_status": dict(self._gateway_status),
+                "region": self.region_detector.snapshot(),
                 "active_node": self._active_node,
                 "serial_connected": self._serial_connected,
                 "paused": self._paused,

@@ -19,6 +19,8 @@
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "echoguard_protocol.h"
+#include "echoguard_region_csi.h"
+#include "echoguard_region_protocol.h"
 #include "aht20_crc.h"
 #include "echoguard_lora.h"
 #include "wifi_gateway_selector.h"
@@ -57,10 +59,12 @@
 #define UDP_KEEPALIVE_TASK_STACK_SIZE   4096
 #define CSI_SENSOR_TASK_STACK_SIZE      6144
 #define LORA_SEND_TASK_STACK_SIZE       4096
+#define REGION_UPLOAD_TASK_STACK_SIZE   4096
 #define WIFI_TASK_PRIORITY              5
 #define UDP_KEEPALIVE_TASK_PRIORITY     4
 #define CSI_SENSOR_TASK_PRIORITY        6
 #define LORA_SEND_TASK_PRIORITY         5
+#define REGION_UPLOAD_TASK_PRIORITY     4
 
 /* Gateway 向该端口发送轻量 UDP keepalive，用于制造稳定 WiFi 下行包并触发 CSI 回调。 */
 #define UDP_KEEPALIVE_PORT              33333
@@ -208,6 +212,7 @@ static uint32_t s_aht20_crc_errors;
 static volatile int8_t s_selected_gateway = WIFI_GATEWAY_NONE;
 static volatile int8_t s_connected_gateway = WIFI_GATEWAY_NONE;
 static volatile uint8_t s_primary_connect_failures;
+static volatile uint32_t s_gateway_ip_addr;
 
 static portMUX_TYPE s_csi_lock = portMUX_INITIALIZER_UNLOCKED;
 static float s_csi_window[CSI_WINDOW_SIZE];
@@ -233,6 +238,7 @@ static void wifi_sta_task(void *arg);
 static void udp_keepalive_rx_task(void *arg);
 static void csi_sensor_task(void *arg);
 static void lora_send_task(void *arg);
+static void region_feature_upload_task(void *arg);
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static esp_err_t wifi_sta_init(void);
 static esp_err_t wifi_select_and_connect(void);
@@ -263,7 +269,7 @@ static uint8_t clamp_u8_int(int value);
 void app_main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    ESP_LOGI(TAG, "ESP32-S3 WiFi CSI + Sensor Fusion + LoRa rescue node starting");
+    ESP_LOGI(TAG, "EchoGuard Node v0.4.0 WiFi multi-link CSI + Sensor Fusion starting");
     ESP_LOGI(TAG, "任务优先级: wifi_sta=%d, csi_sensor=%d, lora_send=%d",
              WIFI_TASK_PRIORITY, CSI_SENSOR_TASK_PRIORITY, LORA_SEND_TASK_PRIORITY);
 
@@ -285,8 +291,12 @@ void app_main(void)
                                     NULL, CSI_SENSOR_TASK_PRIORITY, NULL);
     BaseType_t lora_ok = xTaskCreate(lora_send_task, "lora_send", LORA_SEND_TASK_STACK_SIZE,
                                      NULL, LORA_SEND_TASK_PRIORITY, NULL);
+    BaseType_t region_ok = xTaskCreate(region_feature_upload_task, "region_upload",
+                                       REGION_UPLOAD_TASK_STACK_SIZE, NULL,
+                                       REGION_UPLOAD_TASK_PRIORITY, NULL);
 
-    if (wifi_ok != pdPASS || udp_ok != pdPASS || csi_ok != pdPASS || lora_ok != pdPASS) {
+    if (wifi_ok != pdPASS || udp_ok != pdPASS || csi_ok != pdPASS ||
+        lora_ok != pdPASS || region_ok != pdPASS) {
         ESP_LOGE(TAG, "创建核心任务失败，请增大 heap 或检查 FreeRTOS 配置");
     }
 }
@@ -384,6 +394,9 @@ static esp_err_t wifi_sta_init(void)
 
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "esp_wifi_set_mode STA failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_ps(WIFI_PS_NONE), TAG, "disable WiFi power save failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20),
+                        TAG, "set STA HT20 failed");
     ESP_LOGI(TAG, "WiFi STA 已启动，WPA2-PSK Gateway 优先级: %s -> %s",
              WIFI_PRIMARY_SSID, WIFI_SECONDARY_SSID);
 
@@ -494,6 +507,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         return;
     }
 
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
+        wifi_event_sta_connected_t *connected = (wifi_event_sta_connected_t *)event_data;
+        echoguard_region_csi_set_gateway(
+            connected->bssid,
+            s_selected_gateway == WIFI_GATEWAY_SECONDARY
+        );
+        return;
+    }
+
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         wifi_event_sta_disconnected_t *disconnected = (wifi_event_sta_disconnected_t *)event_data;
@@ -505,6 +527,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
                  wifi_gateway_name(s_selected_gateway), disconnected->reason,
                  s_primary_connect_failures);
         s_connected_gateway = WIFI_GATEWAY_NONE;
+        s_gateway_ip_addr = 0U;
+        echoguard_region_csi_set_disconnected();
         xEventGroupSetBits(s_wifi_event_group, WIFI_RESELECT_BIT);
         return;
     }
@@ -512,6 +536,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         s_connected_gateway = s_selected_gateway;
+        s_gateway_ip_addr = event->ip_info.gw.addr;
         s_primary_connect_failures = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         ESP_LOGI(TAG, "WiFi 已连接 Gateway: ssid=%s IP=" IPSTR,
@@ -562,6 +587,7 @@ static void udp_keepalive_rx_task(void *arg)
                                (struct sockaddr *)&source_addr, &source_len);
             if (len > 0) {
                 buffer[len] = '\0';
+                (void)echoguard_region_csi_handle_sync(buffer, (size_t)len);
                 received++;
                 if (received == 1 || (received % 100U) == 0U) {
                     esp_ip4_addr_t source_ip = {
@@ -581,6 +607,68 @@ static void udp_keepalive_rx_task(void *arg)
 
         close(sock);
         ESP_LOGI(TAG, "UDP keepalive listener stopped, waiting WiFi reconnect");
+    }
+}
+
+/* 区域特征走 WiFi UDP 上行，LoRa 继续保持原 14 字节传感器协议。 */
+static void region_feature_upload_task(void *arg)
+{
+    (void)arg;
+    uint32_t sent_count = 0U;
+
+    while (true) {
+        xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
+                            pdFALSE, pdTRUE, portMAX_DELAY);
+        if (s_connected_gateway != WIFI_GATEWAY_SECONDARY || s_gateway_ip_addr == 0U) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+        if (sock < 0) {
+            ESP_LOGW(TAG, "region UDP socket create failed: errno=%d", errno);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "triangle region feature uplink ready: gateway=%s port=%u",
+                 wifi_gateway_name(s_connected_gateway), ECHOGUARD_REGION_FEATURE_PORT);
+        while ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0 &&
+               s_connected_gateway == WIFI_GATEWAY_SECONDARY) {
+            echoguard_region_packet_t packet = {0};
+            if (!echoguard_region_csi_snapshot(&packet)) {
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+
+            uint8_t payload[ECHOGUARD_REGION_PACKET_LEN] = {0};
+            if (!echoguard_region_packet_encode(&packet, payload)) {
+                ESP_LOGW(TAG, "region feature encode rejected");
+                vTaskDelay(pdMS_TO_TICKS(500));
+                continue;
+            }
+
+            struct sockaddr_in destination = {
+                .sin_family = AF_INET,
+                .sin_port = htons(ECHOGUARD_REGION_FEATURE_PORT),
+                .sin_addr.s_addr = s_gateway_ip_addr,
+            };
+            int sent = sendto(sock, payload, sizeof(payload), 0,
+                              (struct sockaddr *)&destination, sizeof(destination));
+            if (sent == (int)sizeof(payload)) {
+                sent_count++;
+                if (sent_count == 1U || (sent_count % 20U) == 0U) {
+                    ESP_LOGI(TAG, "region feature sent count=%" PRIu32
+                             " seq=%" PRIu32 " links=%u sync=%u",
+                             sent_count, packet.sequence, packet.link_count,
+                             (packet.flags & ECHOGUARD_REGION_FLAG_SYNC_OK) != 0U);
+                }
+            } else {
+                ESP_LOGW(TAG, "region feature send failed: sent=%d errno=%d", sent, errno);
+            }
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        close(sock);
     }
 }
 
@@ -722,18 +810,22 @@ static esp_err_t csi_init_once(void)
     wifi_csi_config_t csi_config = {
         .lltf_en = true,
         .htltf_en = true,
-        .stbc_htltf2_en = true,
-        .ltf_merge_en = true,
+        .stbc_htltf2_en = false,
+        .ltf_merge_en = false,
         .channel_filter_en = false,
         .manu_scale = false,
         .shift = 0,
         .dump_ack_en = false,
     };
 
+    ESP_RETURN_ON_ERROR(echoguard_region_csi_init(NODE_ID), TAG,
+                        "multi-link region CSI init failed");
+    ESP_RETURN_ON_ERROR(esp_wifi_set_promiscuous(true), TAG,
+                        "enable CSI promiscuous mode failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_csi_config(&csi_config), TAG, "esp_wifi_set_csi_config failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_csi_rx_cb(wifi_csi_rx_cb, NULL), TAG, "esp_wifi_set_csi_rx_cb failed");
     ESP_RETURN_ON_ERROR(esp_wifi_set_csi(true), TAG, "esp_wifi_set_csi enable failed");
-    ESP_LOGI(TAG, "WiFi CSI 已启用：LLTF/HT-LTF + 滑动窗口幅度扰动特征");
+    ESP_LOGI(TAG, "WiFi CSI 已启用：分来源多链路 + 52 子载波区域特征");
     return ESP_OK;
 }
 
@@ -742,6 +834,11 @@ static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *data)
     (void)ctx;
 
     if (data == NULL || data->buf == NULL || data->len < 8) {
+        return;
+    }
+
+    int region_source = echoguard_region_csi_ingest(data);
+    if (region_source != ECHOGUARD_REGION_SOURCE_GATEWAY) {
         return;
     }
 

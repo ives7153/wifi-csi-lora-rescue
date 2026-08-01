@@ -16,9 +16,9 @@ class RepositoryConsistencyTests(unittest.TestCase):
         return [ROOT / item.decode("utf-8") for item in output.split(b"\0") if item]
 
     def test_release_names_share_one_version(self) -> None:
-        self.assertEqual(DISPLAY_VERSION, "v0.3.3")
-        self.assertEqual(STANDARD_DIST_NAME, "EchoGuard-v0.3.3-windows")
-        self.assertEqual(MOBILE_DIST_NAME, "EchoGuard-Mobile-v0.3.3-windows")
+        self.assertEqual(DISPLAY_VERSION, "v0.4.0")
+        self.assertEqual(STANDARD_DIST_NAME, "EchoGuard-v0.4.0-windows")
+        self.assertEqual(MOBILE_DIST_NAME, "EchoGuard-Mobile-v0.4.0-windows")
 
     def test_tracked_text_no_longer_mentions_sht20(self) -> None:
         offenders: list[str] = []

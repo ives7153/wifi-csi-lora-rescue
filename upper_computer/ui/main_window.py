@@ -220,6 +220,8 @@ class MainWindow(QMainWindow):
     ai_action_requested = pyqtSignal(object)
     recording_toggled = pyqtSignal(bool)
     replay_requested = pyqtSignal(str)
+    region_calibration_phase_requested = pyqtSignal(str)
+    region_calibration_cancel_requested = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -418,6 +420,12 @@ class MainWindow(QMainWindow):
         self.dashboard_page.ai_models_requested.connect(self.ai_models_requested.emit)
         self.dashboard_page.ai_llm_test_requested.connect(self.ai_llm_test_requested.emit)
         self.dashboard_page.ai_action_requested.connect(self.ai_action_requested.emit)
+        self.dashboard_page.region_calibration_phase_requested.connect(
+            self.region_calibration_phase_requested.emit
+        )
+        self.dashboard_page.region_calibration_cancel_requested.connect(
+            self.region_calibration_cancel_requested.emit
+        )
 
         # 历史页导出
         self.history_page.export_csv_requested.connect(self.export_csv_requested.emit)
