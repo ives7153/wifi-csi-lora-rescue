@@ -140,6 +140,37 @@ class RegionDetectionTests(unittest.TestCase):
         self.assertLessEqual(detector.validation_metrics["outside_false_positive"], 0.05)
         self.assertEqual(detector.validation_metrics["cv_folds"], 5.0)
 
+    def test_production_phase_minimums_survive_training_downsample(self) -> None:
+        """180 秒阶段达到 250 条后不能被限量逻辑重新压成“不足”。"""
+        with tempfile.TemporaryDirectory() as directory:
+            detector = TriangleRegionDetector(Path(directory) / "profile.json")
+            detector.node_macs = {
+                node: f"02:00:00:00:00:0{node}" for node in (1, 2, 3)
+            }
+            width = 6
+            detector.samples = {
+                "empty": [
+                    [0.08 + (index % 5) * 0.0005] * width
+                    for index in range(region_module.MIN_PHASE_SAMPLES["empty"])
+                ],
+                "inside": [
+                    [0.82 + (index % 5) * 0.0005] * width
+                    for index in range(region_module.MIN_PHASE_SAMPLES["inside"])
+                ],
+                "outside": [
+                    [0.24 + (index % 5) * 0.0005] * width
+                    for index in range(region_module.MIN_PHASE_SAMPLES["outside"])
+                ],
+            }
+
+            detector._train_and_save()
+
+        self.assertIsNotNone(detector.profile)
+        self.assertGreaterEqual(detector.validation_metrics["inside_recall"], 0.95)
+        self.assertLessEqual(
+            detector.validation_metrics["outside_false_positive"], 0.05
+        )
+
     def test_two_inside_and_three_outside_windows_apply_hysteresis(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             detector = TriangleRegionDetector(Path(directory) / "profile.json")

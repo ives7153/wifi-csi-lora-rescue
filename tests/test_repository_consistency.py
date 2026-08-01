@@ -44,6 +44,14 @@ class RepositoryConsistencyTests(unittest.TestCase):
                 forbidden.append(relative)
         self.assertEqual(forbidden, [])
 
+    def test_gateway_console_supports_usb_uart_and_native_usb(self) -> None:
+        defaults = (ROOT / "firmware" / "gateway" / "sdkconfig.defaults").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("CONFIG_ESP_CONSOLE_UART_DEFAULT=y", defaults)
+        self.assertIn("CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y", defaults)
+        self.assertIn("CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200", defaults)
+
 
 if __name__ == "__main__":
     unittest.main()

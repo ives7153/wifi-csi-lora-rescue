@@ -27,7 +27,7 @@ temp_x10:i16
 hum:u8
 ```
 
-Gateway 固件接收 LoRa 帧后，补充 Gateway 侧 LoRa RSSI 与本机时间戳，并通过 USB Serial/JTAG 输出一行 JSON：
+Gateway 固件接收 LoRa 帧后，补充 Gateway 侧 LoRa RSSI 与本机时间戳，并通过 UART0/USB-UART 或 USB Serial/JTAG 输出一行 JSON：
 
 ```json
 {

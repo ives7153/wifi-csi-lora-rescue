@@ -154,11 +154,20 @@ static void gateway_print_status(void);
 static bool format_region_json(const region_rx_packet_t *received, char *output, size_t capacity);
 static size_t append_format(char *output, size_t capacity, size_t offset, const char *format, ...);
 
-/* 串口初始化：ESP32-S3 USB Serial/JTAG 由 sdkconfig.defaults 选择，stdio 直接输出到上位机。 */
+/* stdio 控制台由当前 sdkconfig 选择；自制 GW-02 板使用 UART0/CH340，
+ * 同时保留 USB Serial/JTAG 作为第二输出。 */
 static void serial_console_init(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    ESP_LOGI(TAG, "USB Serial/JTAG console ready, baud=115200");
+#if defined(CONFIG_ESP_CONSOLE_UART) && defined(CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG)
+    ESP_LOGI(TAG, "UART0 console ready, secondary USB Serial/JTAG enabled, baud=115200");
+#elif defined(CONFIG_ESP_CONSOLE_UART)
+    ESP_LOGI(TAG, "UART console ready, baud=115200");
+#elif defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG)
+    ESP_LOGI(TAG, "USB Serial/JTAG console ready");
+#else
+    ESP_LOGI(TAG, "configured stdio console ready");
+#endif
 }
 
 /* WiFi SoftAP 任务：启动 WPA2-PSK 热点，提供纯局域网调试入口，不做外网转发。 */

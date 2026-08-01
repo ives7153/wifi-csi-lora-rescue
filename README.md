@@ -14,7 +14,7 @@
 EchoGuard 由三部分组成：
 
 - **Rescue Node 感知节点**：ESP32-S3 采集 WiFi CSI、AHT20 温湿度、姿态和 MQ-135 气体原始值，并通过 Ra-02/SX1278 LoRa 模块上报。
-- **Gateway 汇聚网关**：ESP32-S3 接收 LoRa 帧，将节点数据转换为 JSON Lines，经 USB Serial/JTAG 输出给上位机。
+- **Gateway 汇聚网关**：ESP32-S3 接收 LoRa 帧，将节点数据转换为 JSON Lines，经 UART0/USB-UART 或 USB Serial/JTAG 输出给上位机。
 - **EchoGuard 上位机**：PyQt6 桌面程序，负责串口接收、节点自动发现、实时曲线、事件流、历史导出、规则报警、AI 辅助解释和现场问答。
 
 本项目强调“真实数据链路优先”：未收到 Gateway 串口帧前，上位机不生成假节点、不伪造历史样本；实时结论由规则融合输出，AI 只做异步辅助解释。
@@ -45,7 +45,7 @@ Rescue Node(s)
 Gateway
   ESP32-S3 + SX1278 LoRa receiver
         |
-        | USB Serial/JTAG JSON Lines @ 115200
+        | UART0/USB-UART or USB Serial/JTAG JSON Lines @ 115200
         v
 EchoGuard Upper Computer
   PyQt6 UI + parser + rule fusion + export + AI helper/chat
@@ -163,6 +163,8 @@ idf.py -p COMx flash monitor
 ```
 
 每个实体节点烧录前，需要在 `menuconfig -> Rescue Node Configuration -> Rescue node ID` 中设置唯一编号，例如 `1 / 2 / 3 / 4`。Gateway 串口输出中的 `id` 会直接作为上位机节点编号。
+
+Gateway 默认以 UART0（115200）作为主控制台，并将输出同步到 ESP32-S3 USB Serial/JTAG；因此带 CH340/CP210x 的自制板和带原生 USB 接口的开发板都可向上位机输出同一套 JSON Lines。
 
 ## 三角形区域检测部署与标定
 

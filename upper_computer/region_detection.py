@@ -27,6 +27,7 @@ PHASE_DURATIONS = {"empty": 60.0, "inside": 180.0, "outside": 180.0}
 PHASE_LABELS = {"empty": "空场", "inside": "区域内部", "outside": "区域外部"}
 PHASE_ORDER = ("empty", "inside", "outside")
 MIN_PHASE_SAMPLES = {"empty": 80, "inside": 250, "outside": 250}
+MAX_PHASE_TRAINING_SAMPLES = 300
 
 
 class CalibrationError(RuntimeError):
@@ -462,9 +463,17 @@ class TriangleRegionDetector:
         raw_rows: list[list[float]] = []
         raw_labels: list[str] = []
         for label in PHASE_ORDER:
-            rows = _downsample(self.samples[label])
-            if len(rows) < MIN_PHASE_SAMPLES[label]:
+            minimum = MIN_PHASE_SAMPLES[label]
+            source_rows = self.samples[label]
+            if len(source_rows) < minimum:
                 raise CalibrationError(f"{PHASE_LABELS[label]}有效样本不足")
+            # 先检查原始有效样本数，再做训练集限量；限量上限绝不能低于
+            # 该阶段的最低要求。旧逻辑固定压到 240 条，而 inside/outside
+            # 各要求 250 条，导致现场采满 180 秒后仍必然标定失败。
+            rows = _downsample(
+                source_rows,
+                maximum=max(MAX_PHASE_TRAINING_SAMPLES, minimum),
+            )
             raw_rows.extend(rows)
             raw_labels.extend([label] * len(rows))
         medians, scales, selected = _fit_feature_space(raw_rows, raw_labels)
