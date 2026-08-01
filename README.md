@@ -1,6 +1,6 @@
 # EchoGuard
 
-[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.3.2-e7352c?logo=espressif)](https://docs.espressif.com/projects/esp-idf/)
+[![ESP-IDF](https://img.shields.io/badge/ESP--IDF-v5.2.6-e7352c?logo=espressif)](https://docs.espressif.com/projects/esp-idf/)
 [![Python](https://img.shields.io/badge/Python-3.11+-3776ab?logo=python&logoColor=white)](https://www.python.org/)
 [![PyQt6](https://img.shields.io/badge/UI-PyQt6-41cd52?logo=qt&logoColor=white)](https://www.riverbankcomputing.com/software/pyqt/)
 [![Platform](https://img.shields.io/badge/Platform-ESP32--S3%20%7C%20Windows-lightgrey)](#)
@@ -13,7 +13,7 @@
 
 EchoGuard 由三部分组成：
 
-- **Rescue Node 感知节点**：ESP32-S3 采集 WiFi CSI、SHT20 温湿度、姿态和 MQ-135 气体原始值，并通过 Ra-02/SX1278 LoRa 模块上报。
+- **Rescue Node 感知节点**：ESP32-S3 采集 WiFi CSI、AHT20 温湿度、姿态和 MQ-135 气体原始值，并通过 Ra-02/SX1278 LoRa 模块上报。
 - **Gateway 汇聚网关**：ESP32-S3 接收 LoRa 帧，将节点数据转换为 JSON Lines，经 USB Serial/JTAG 输出给上位机。
 - **EchoGuard 上位机**：PyQt6 桌面程序，负责串口接收、节点自动发现、实时曲线、事件流、历史导出、规则报警和 AI 辅助解释。
 
@@ -35,7 +35,7 @@ EchoGuard 由三部分组成：
 
 ```text
 Rescue Node(s)
-  ESP32-S3 + WiFi CSI + SHT20/MPU6050/MQ-135
+  ESP32-S3 + WiFi CSI + AHT20/MPU6050/MQ-135
         |
         | 14-byte LoRa binary frame
         v
@@ -108,7 +108,7 @@ wifi-csi-lora-rescue/
 - ESP32-S3-DevKitC-1 N8R8 开发板至少 2 块：1 块 Gateway，1 块 Rescue Node。
 - Ra-02/SX1278 LoRa 模块每块板 1 个。
 - 433 MHz 匹配天线，上电和发射前必须安装。
-- 节点侧可接 SHT20、MPU6050、MQ-135。
+- 节点侧可接 AHT20、MPU6050、MQ-135。
 - USB 数据线、杜邦线、面包板或焊接底板、稳定 5V 电源。
 
 硬件接线请先阅读：
@@ -118,7 +118,12 @@ wifi-csi-lora-rescue/
 
 ## 固件构建
 
-本项目固件使用 ESP-IDF v5.3.2，目标芯片为 ESP32-S3。
+本项目固件使用 ESP-IDF v5.2.6，目标芯片为 ESP32-S3。
+
+Gateway 默认启动 `EchoGuard-GW-01` WPA2-PSK SoftAP，也可在
+`menuconfig -> EchoGuard Gateway Configuration -> Gateway SoftAP SSID`
+中构建为 `EchoGuard-GW-02`。两个网关使用相同密码 `511511511`。Rescue Node
+会自动扫描两个 SSID，优先连接 GW-01；GW-01 不可用或连续连接失败时回退到 GW-02。
 
 确认环境：
 

@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "driver/gpio.h"
@@ -25,16 +26,21 @@
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 
-/* 节点基本信息：STA 连接 Gateway 开放 SoftAP，用于获得稳定的 WiFi 包流并触发 CSI 回调。 */
+/* 节点基本信息：GW-01 优先，GW-02 回退；两者使用相同 WPA2-PSK 密码。 */
 #ifndef CONFIG_RESCUE_NODE_ID
 #define CONFIG_RESCUE_NODE_ID           1
 #endif
 #define NODE_ID                         CONFIG_RESCUE_NODE_ID
-#define WIFI_STA_SSID                   "RuView-Rescue-GW-01"
-#define WIFI_STA_CHANNEL_HINT           6
+#define WIFI_PRIMARY_SSID               "EchoGuard-GW-01"
+#define WIFI_SECONDARY_SSID             "EchoGuard-GW-02"
+#define WIFI_STA_PASSWORD               "511511511"
+#define WIFI_SCAN_MAX_APS               16
+#define WIFI_RESELECT_DELAY_MS          2000
+#define WIFI_CONNECT_TIMEOUT_MS         12000
+#define WIFI_PRIMARY_FAILURE_LIMIT      3
 
 /* FreeRTOS 任务参数：本固件只创建 3 个业务任务，优先级与栈大小集中写在这里便于现场调整。 */
-#define WIFI_TASK_STACK_SIZE            4096
+#define WIFI_TASK_STACK_SIZE            6144
 #define UDP_KEEPALIVE_TASK_STACK_SIZE   4096
 #define CSI_SENSOR_TASK_STACK_SIZE      6144
 #define LORA_SEND_TASK_STACK_SIZE       4096
@@ -93,6 +99,7 @@
 /* WiFi 事件位：任务间只传递状态，不额外创建 WiFi 管理任务。 */
 #define WIFI_STARTED_BIT                BIT0
 #define WIFI_CONNECTED_BIT              BIT1
+#define WIFI_RESELECT_BIT               BIT2
 
 /* SX1278 常用寄存器地址。 */
 #define REG_FIFO                        0x00
@@ -162,6 +169,28 @@ typedef struct {
     int8_t last_rssi;
 } csi_window_features_t;
 
+typedef struct {
+    const char *ssid;
+    const char *password;
+} wifi_gateway_profile_t;
+
+enum {
+    WIFI_GATEWAY_PRIMARY = 0,
+    WIFI_GATEWAY_SECONDARY = 1,
+    WIFI_GATEWAY_NONE = -1,
+};
+
+static const wifi_gateway_profile_t s_gateway_profiles[] = {
+    [WIFI_GATEWAY_PRIMARY] = {
+        .ssid = WIFI_PRIMARY_SSID,
+        .password = WIFI_STA_PASSWORD,
+    },
+    [WIFI_GATEWAY_SECONDARY] = {
+        .ssid = WIFI_SECONDARY_SSID,
+        .password = WIFI_STA_PASSWORD,
+    },
+};
+
 static const char *TAG = "rescue_node";
 
 static EventGroupHandle_t s_wifi_event_group;
@@ -176,6 +205,9 @@ static bool s_i2c_scan_done;
 static int64_t s_last_i2c_scan_ms;
 static bool s_aht20_initialized;
 static bool s_aht20_logged_first_read;
+static volatile int8_t s_selected_gateway = WIFI_GATEWAY_NONE;
+static volatile int8_t s_connected_gateway = WIFI_GATEWAY_NONE;
+static volatile uint8_t s_primary_connect_failures;
 
 static portMUX_TYPE s_csi_lock = portMUX_INITIALIZER_UNLOCKED;
 static float s_csi_window[CSI_WINDOW_SIZE];
@@ -203,6 +235,8 @@ static void csi_sensor_task(void *arg);
 static void lora_send_task(void *arg);
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static esp_err_t wifi_sta_init(void);
+static esp_err_t wifi_select_and_connect(void);
+static const char *wifi_gateway_name(int gateway_index);
 static esp_err_t csi_init_once(void);
 static void wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *data);
 static csi_window_features_t csi_window_snapshot(void);
@@ -268,7 +302,7 @@ static esp_err_t nvs_init_for_wifi(void)
     return ret;
 }
 
-/* wifi_sta_task：负责 STA 初始化、连接开放 SoftAP、断线重连和状态心跳。 */
+/* wifi_sta_task：扫描两个 WPA2 SoftAP，按 GW-01 优先规则连接并在断线后重新选择。 */
 static void wifi_sta_task(void *arg)
 {
     (void)arg;
@@ -278,13 +312,48 @@ static void wifi_sta_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(2000));
     }
 
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_STARTED_BIT, pdFALSE, pdTRUE, portMAX_DELAY);
+
+    bool first_selection = true;
     while (true) {
         EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
-        ESP_LOGI(TAG, "WiFi STA 心跳: ssid=%s, started=%d, connected=%d",
-                 WIFI_STA_SSID,
-                 (bits & WIFI_STARTED_BIT) != 0,
-                 (bits & WIFI_CONNECTED_BIT) != 0);
-        vTaskDelay(pdMS_TO_TICKS(30000));
+        if ((bits & WIFI_CONNECTED_BIT) != 0) {
+            ESP_LOGI(TAG, "WiFi STA 心跳: ssid=%s, started=1, connected=1",
+                     wifi_gateway_name(s_connected_gateway));
+            (void)xEventGroupWaitBits(s_wifi_event_group, WIFI_RESELECT_BIT,
+                                      pdTRUE, pdFALSE, pdMS_TO_TICKS(30000));
+            continue;
+        }
+
+        xEventGroupClearBits(s_wifi_event_group, WIFI_RESELECT_BIT);
+        if (!first_selection) {
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RESELECT_DELAY_MS));
+        }
+        first_selection = false;
+
+        esp_err_t ret = wifi_select_and_connect();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "未连接到 Gateway，%d ms 后重新扫描: %s",
+                     WIFI_RESELECT_DELAY_MS, esp_err_to_name(ret));
+            continue;
+        }
+
+        bits = xEventGroupWaitBits(s_wifi_event_group,
+                                   WIFI_CONNECTED_BIT | WIFI_RESELECT_BIT,
+                                   pdFALSE, pdFALSE,
+                                   pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS));
+        if ((bits & WIFI_CONNECTED_BIT) != 0) {
+            continue;
+        }
+        if ((bits & WIFI_RESELECT_BIT) != 0) {
+            xEventGroupClearBits(s_wifi_event_group, WIFI_RESELECT_BIT);
+            continue;
+        }
+
+        ESP_LOGW(TAG, "连接 %s 超时，重新选择 Gateway",
+                 wifi_gateway_name(s_selected_gateway));
+        (void)esp_wifi_disconnect();
+        xEventGroupSetBits(s_wifi_event_group, WIFI_RESELECT_BIT);
     }
 }
 
@@ -313,28 +382,110 @@ static esp_err_t wifi_sta_init(void)
                                                             wifi_event_handler, NULL, NULL),
                         TAG, "register IP_EVENT handler failed");
 
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_STA_SSID,
-            .password = "",
-            .scan_method = WIFI_FAST_SCAN,
-            .channel = WIFI_STA_CHANNEL_HINT,
-            .threshold = {
-                .authmode = WIFI_AUTH_OPEN,
-            },
-            .pmf_cfg = {
-                .capable = true,
-                .required = false,
-            },
-        },
-    };
-
     ESP_RETURN_ON_ERROR(esp_wifi_set_mode(WIFI_MODE_STA), TAG, "esp_wifi_set_mode STA failed");
-    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config), TAG, "esp_wifi_set_config STA failed");
     ESP_RETURN_ON_ERROR(esp_wifi_start(), TAG, "esp_wifi_start failed");
-    ESP_LOGI(TAG, "WiFi STA 已启动，目标开放热点: %s", WIFI_STA_SSID);
+    ESP_LOGI(TAG, "WiFi STA 已启动，WPA2-PSK Gateway 优先级: %s -> %s",
+             WIFI_PRIMARY_SSID, WIFI_SECONDARY_SSID);
 
     return ESP_OK;
+}
+
+static const char *wifi_gateway_name(int gateway_index)
+{
+    if (gateway_index < WIFI_GATEWAY_PRIMARY || gateway_index > WIFI_GATEWAY_SECONDARY) {
+        return "none";
+    }
+    return s_gateway_profiles[gateway_index].ssid;
+}
+
+static esp_err_t wifi_select_and_connect(void)
+{
+    wifi_scan_config_t scan_config = {
+        .show_hidden = false,
+        .scan_type = WIFI_SCAN_TYPE_ACTIVE,
+    };
+    esp_err_t ret = esp_wifi_scan_start(&scan_config, true);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Gateway 扫描启动失败: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint16_t found_count = 0;
+    ESP_RETURN_ON_ERROR(esp_wifi_scan_get_ap_num(&found_count), TAG, "scan_get_ap_num failed");
+
+    uint16_t record_count = found_count < WIFI_SCAN_MAX_APS ? found_count : WIFI_SCAN_MAX_APS;
+    wifi_ap_record_t *records = NULL;
+    if (record_count > 0) {
+        records = calloc(record_count, sizeof(*records));
+        if (records == NULL) {
+            (void)esp_wifi_clear_ap_list();
+            ESP_LOGE(TAG, "分配 Gateway 扫描结果失败，count=%u", record_count);
+            return ESP_ERR_NO_MEM;
+        }
+        ret = esp_wifi_scan_get_ap_records(&record_count, records);
+        if (ret != ESP_OK) {
+            free(records);
+            ESP_LOGW(TAG, "读取 Gateway 扫描结果失败: %s", esp_err_to_name(ret));
+            return ret;
+        }
+    } else {
+        (void)esp_wifi_clear_ap_list();
+    }
+
+    bool visible[2] = {false, false};
+    uint8_t channel[2] = {0, 0};
+    int8_t rssi[2] = {0, 0};
+    for (uint16_t i = 0; i < record_count; ++i) {
+        for (int gateway = WIFI_GATEWAY_PRIMARY; gateway <= WIFI_GATEWAY_SECONDARY; ++gateway) {
+            if (strcmp((const char *)records[i].ssid, s_gateway_profiles[gateway].ssid) == 0 &&
+                records[i].authmode >= WIFI_AUTH_WPA2_PSK) {
+                visible[gateway] = true;
+                channel[gateway] = records[i].primary;
+                rssi[gateway] = records[i].rssi;
+            }
+        }
+    }
+    free(records);
+
+    int selected = WIFI_GATEWAY_NONE;
+    if (visible[WIFI_GATEWAY_PRIMARY] &&
+        (s_primary_connect_failures < WIFI_PRIMARY_FAILURE_LIMIT ||
+         !visible[WIFI_GATEWAY_SECONDARY])) {
+        selected = WIFI_GATEWAY_PRIMARY;
+    } else if (visible[WIFI_GATEWAY_SECONDARY]) {
+        selected = WIFI_GATEWAY_SECONDARY;
+    }
+
+    if (selected == WIFI_GATEWAY_NONE) {
+        ESP_LOGW(TAG, "扫描未发现可用 Gateway: primary=%d secondary=%d",
+                 visible[WIFI_GATEWAY_PRIMARY], visible[WIFI_GATEWAY_SECONDARY]);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    wifi_config_t wifi_config = {0};
+    snprintf((char *)wifi_config.sta.ssid, sizeof(wifi_config.sta.ssid), "%s",
+             s_gateway_profiles[selected].ssid);
+    snprintf((char *)wifi_config.sta.password, sizeof(wifi_config.sta.password), "%s",
+             s_gateway_profiles[selected].password);
+    wifi_config.sta.scan_method = WIFI_ALL_CHANNEL_SCAN;
+    wifi_config.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+    wifi_config.sta.channel = channel[selected];
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+    wifi_config.sta.pmf_cfg.capable = true;
+    wifi_config.sta.pmf_cfg.required = false;
+
+    ESP_RETURN_ON_ERROR(esp_wifi_set_config(WIFI_IF_STA, &wifi_config),
+                        TAG, "esp_wifi_set_config STA failed");
+    s_selected_gateway = selected;
+    ESP_LOGI(TAG, "选择 Gateway: ssid=%s channel=%u rssi=%d primary_failures=%u",
+             wifi_gateway_name(selected), channel[selected], rssi[selected],
+             s_primary_connect_failures);
+
+    ret = esp_wifi_connect();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "连接 %s 调用失败: %s", wifi_gateway_name(selected), esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -343,28 +494,32 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         xEventGroupSetBits(s_wifi_event_group, WIFI_STARTED_BIT);
-        esp_err_t ret = esp_wifi_connect();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "首次连接 Gateway SoftAP 失败: %s", esp_err_to_name(ret));
-        }
+        xEventGroupSetBits(s_wifi_event_group, WIFI_RESELECT_BIT);
         return;
     }
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
         wifi_event_sta_disconnected_t *disconnected = (wifi_event_sta_disconnected_t *)event_data;
-        ESP_LOGW(TAG, "WiFi 断开，reason=%d，准备自动重连", disconnected->reason);
-        esp_err_t ret = esp_wifi_connect();
-        if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "WiFi 重连调用失败: %s", esp_err_to_name(ret));
+        if (s_selected_gateway == WIFI_GATEWAY_PRIMARY &&
+            s_primary_connect_failures < UINT8_MAX) {
+            ++s_primary_connect_failures;
         }
+        ESP_LOGW(TAG, "WiFi 断开: ssid=%s reason=%d primary_failures=%u，准备重新选择",
+                 wifi_gateway_name(s_selected_gateway), disconnected->reason,
+                 s_primary_connect_failures);
+        s_connected_gateway = WIFI_GATEWAY_NONE;
+        xEventGroupSetBits(s_wifi_event_group, WIFI_RESELECT_BIT);
         return;
     }
 
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        s_connected_gateway = s_selected_gateway;
+        s_primary_connect_failures = 0;
         xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
-        ESP_LOGI(TAG, "WiFi 已连接 Gateway，IP=" IPSTR, IP2STR(&event->ip_info.ip));
+        ESP_LOGI(TAG, "WiFi 已连接 Gateway: ssid=%s IP=" IPSTR,
+                 wifi_gateway_name(s_connected_gateway), IP2STR(&event->ip_info.ip));
     }
 }
 

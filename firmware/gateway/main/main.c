@@ -21,8 +21,12 @@
 #include "lwip/sockets.h"
 #include "nvs_flash.h"
 
-/* Gateway 基本信息：开放 SoftAP，仅用于现场局域网发现与后续调试。 */
-#define WIFI_SOFTAP_SSID          "RuView-Rescue-GW-01"
+/* Gateway 基本信息：SSID 由本地 sdkconfig 选择，密码不打印到运行日志。 */
+#ifndef CONFIG_ECHOGUARD_GATEWAY_SSID
+#define CONFIG_ECHOGUARD_GATEWAY_SSID "EchoGuard-GW-01"
+#endif
+#define WIFI_SOFTAP_SSID          CONFIG_ECHOGUARD_GATEWAY_SSID
+#define WIFI_SOFTAP_PASSWORD      "511511511"
 #define WIFI_SOFTAP_CHANNEL       6
 #define WIFI_SOFTAP_MAX_CONN      4
 
@@ -126,12 +130,12 @@ static void serial_console_init(void)
     ESP_LOGI(TAG, "USB Serial/JTAG console ready, baud=115200");
 }
 
-/* WiFi SoftAP 任务：启动无密码热点，提供纯局域网调试入口，不做外网转发。 */
+/* WiFi SoftAP 任务：启动 WPA2-PSK 热点，提供纯局域网调试入口，不做外网转发。 */
 static void wifi_softap_task(void *arg)
 {
     (void)arg;
 
-    ESP_LOGI(TAG, "Starting open SoftAP: %s", WIFI_SOFTAP_SSID);
+    ESP_LOGI(TAG, "Starting WPA2-PSK SoftAP: %s", WIFI_SOFTAP_SSID);
 
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -148,9 +152,9 @@ static void wifi_softap_task(void *arg)
             .ssid = WIFI_SOFTAP_SSID,
             .ssid_len = strlen(WIFI_SOFTAP_SSID),
             .channel = WIFI_SOFTAP_CHANNEL,
-            .password = "",
+            .password = WIFI_SOFTAP_PASSWORD,
             .max_connection = WIFI_SOFTAP_MAX_CONN,
-            .authmode = WIFI_AUTH_OPEN,
+            .authmode = WIFI_AUTH_WPA2_PSK,
             .pmf_cfg = {
                 .required = false,
             },
@@ -162,7 +166,7 @@ static void wifi_softap_task(void *arg)
     ESP_ERROR_CHECK(esp_wifi_start());
     xEventGroupSetBits(s_wifi_event_group, WIFI_AP_STARTED_BIT);
 
-    ESP_LOGI(TAG, "SoftAP started, ssid=%s, channel=%d, auth=open",
+    ESP_LOGI(TAG, "SoftAP started, ssid=%s, channel=%d, auth=WPA2-PSK",
              WIFI_SOFTAP_SSID, WIFI_SOFTAP_CHANNEL);
 
     /* WiFi 驱动启动后由系统任务维护；本任务保留心跳，便于现场判断 SoftAP 仍在线。 */

@@ -1,0 +1,10 @@
+menu "EchoGuard Gateway Configuration"
+
+    config ECHOGUARD_GATEWAY_SSID
+        string "Gateway SoftAP SSID"
+        default "EchoGuard-GW-01"
+        help
+            WPA2-PSK SoftAP name used by this Gateway build. Keep GW-01 as
+            the default and override it in a local sdkconfig for GW-02.
+
+endmenu
