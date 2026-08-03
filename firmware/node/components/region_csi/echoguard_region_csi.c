@@ -352,7 +352,7 @@ esp_err_t echoguard_region_csi_init(uint8_t node_id)
     return ESP_OK;
 }
 
-void echoguard_region_csi_set_gateway(const uint8_t bssid[6], bool gw02_connected)
+void echoguard_region_csi_set_gateway(const uint8_t bssid[6], bool gateway_connected)
 {
     if (bssid == NULL) {
         return;
@@ -360,13 +360,13 @@ void echoguard_region_csi_set_gateway(const uint8_t bssid[6], bool gw02_connecte
     portENTER_CRITICAL(&s_lock);
     memcpy(s_gateway_bssid, bssid, 6);
     s_gateway_bssid_valid = true;
-    s_enabled = gw02_connected;
+    s_enabled = gateway_connected;
     s_last_sync_ms = 0U;
     memset(s_current, 0, sizeof(s_current));
     memset(s_previous, 0, sizeof(s_previous));
     portEXIT_CRITICAL(&s_lock);
     ESP_LOGI(TAG, "Gateway CSI source set, triangle mode=%s",
-             gw02_connected ? "GW-02 enabled" : "disabled");
+             gateway_connected ? "enabled" : "disabled");
 }
 
 void echoguard_region_csi_set_disconnected(void)
@@ -477,7 +477,7 @@ bool echoguard_region_csi_snapshot(echoguard_region_packet_t *packet)
     memset(packet, 0, sizeof(*packet));
     packet->node_id = s_node_id;
     memcpy(packet->node_mac, s_node_mac, sizeof(packet->node_mac));
-    packet->flags = ECHOGUARD_REGION_FLAG_GW02_CONNECTED;
+    packet->flags = ECHOGUARD_REGION_FLAG_GATEWAY_CONNECTED;
     uint32_t timestamp = now_ms();
     if (last_sync != 0U && timestamp - last_sync <= REGION_SYNC_TIMEOUT_MS) {
         packet->flags |= ECHOGUARD_REGION_FLAG_SYNC_OK;

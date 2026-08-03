@@ -22,7 +22,7 @@ EchoGuard 由三部分组成：
 ## 核心能力
 
 - WiFi CSI 生命微动感知：基于 ESP32-S3 WiFi CSI 滑动窗口提取幅度扰动特征。
-- 三角形区域检测：Node 1/2/3 与 GW-02 组成 9 条定向 CSI 链路，经现场标定后输出独立的“区域内有人/无人/数据不足”状态；不覆盖原节点 presence。
+- 三角形区域检测：Node 1/2/3 与单活动 Gateway（GW-01 或 GW-02）组成 9 条定向 CSI 链路，上位机自动识别活动 Gateway 并加载其独立标定配置；现场每次只开启一个 Gateway。
 - LoRa 远距离回传：节点与 Gateway 使用 433 MHz、BW125、SF7、CR4/5 的 SX1278 链路。
 - 多节点自动发现：上位机根据 Gateway JSON 中的 `id` 自动创建 `node{id}`。
 - 存在感知硬阈值：节点 presence 低于用户设置值判为无人，达到或高于设置值判为疑似微动；confidence 与 CSI quality 仅用于诊断展示。
@@ -32,7 +32,7 @@ EchoGuard 由三部分组成：
 - 数据导出能力：支持 CSV 导出、融合扰动曲线截图和整窗截图，导出/截图结果通过右上角 toast 弹窗提示。
 - AI 辅助研判与问答：仪表盘显示短摘要，`AI 辅助` 页提供结构化研判、右侧上下文栏和 Markdown 对话；本地 Jina GGUF embedding 用于向量检索，可选大模型 API 用于联网生成回答，AI 不接管实时判断。
 - 数据录制回放：保留原始 Gateway JSON Lines 和接收时间，回放数据明确标记来源，不与实时数据混淆。
-- 双发行版：普通监测版与无密码手机演示控制版共用 v0.5.0 核心代码、真实区域检测器和 PyInstaller 打包流程；手机演示值与区域判定严格隔离。
+- 双发行版：普通监测版与无密码手机演示控制版共用 v0.5.1 核心代码、真实区域检测器和 PyInstaller 打包流程；手机演示值与区域判定严格隔离。
 
 ## 系统架构
 
@@ -50,8 +50,8 @@ Gateway
 EchoGuard Upper Computer
   PyQt6 UI + parser + rule fusion + export + AI helper/chat
 
-Triangle region path (GW-02 only)
-  GW-02 UDP sync -> 3 Nodes ESP-NOW time-slot probes
+Triangle region path (single active GW-01/GW-02)
+  Active GW UDP sync -> 3 Nodes ESP-NOW time-slot probes
   9 directed CSI links -> UDP feature frames -> Gateway JSON Lines
   -> robust calibration + weighted k-NN -> global region state
 ```
@@ -92,7 +92,7 @@ Gateway 输出一行 JSON：
 
 Gateway 每 10 秒还会输出 `type=gateway_status` 状态行，包含固件版本、SSID、LoRa 正确接收数、CRC 错误数、异常长度、队列丢包和 Wi-Fi 客户端数量。状态行仅用于技术诊断，不会创建节点。
 
-区域模式下，Node 1/2/3 每 500 ms 向 GW-02 的 UDP 33334 端口上报 3 条接收链路特征。Gateway 校验 `EGCF` 魔数、协议版本、固定长度和 CRC32 后，额外输出 `type=csi_features` JSON Lines。该数据流不修改原 14 字节 LoRa 协议，也不会作为普通节点历史样本。
+区域模式下，Node 1/2/3 每 500 ms 向当前活动 Gateway（GW-01 或 GW-02）的 UDP 33334 端口上报 3 条接收链路特征。Gateway 校验 `EGCF` 魔数、协议版本、固定长度和 CRC32 后，额外输出 `type=csi_features` JSON Lines。该数据流不修改原 14 字节 LoRa 协议，也不会作为普通节点历史样本。
 
 上位机将字段规范化为 `node_id`、`presence_score`、`motion_score`、`confidence`、`gas_raw`、`gas_ppm`、`temperature`、`humidity`、`rssi` 等内部字段，其中 `gas` 兼容字段等同于 CO2 估算 ppm。详见 [docs/interface_alignment.md](docs/interface_alignment.md)。
 
@@ -185,14 +185,14 @@ idf.py -D SDKCONFIG=sdkconfig.gw01.local -B build-gw01-ota-v051 build
 
 ## 三角形区域检测部署与标定
 
-区域检测固定使用 `EchoGuard-GW-02`；运行时关闭 GW-01，确保三个节点均连接 GW-02。推荐部署：
+区域检测支持 GW-01 与 GW-02 任一作为单活动 Gateway；切换前先关闭当前 Gateway，再开启目标 Gateway，现场每次只开启一个。三个节点按既有优先级自动连接当前开启的 Gateway。推荐部署：
 
 - Node 1/2/3 构成边长约 2 m 的三角形，安装高度 0.8–1.0 m，天线方向和位置固定。
-- GW-02 放在三角形外，距各节点约 2–4 m，作为专用 AP 持续发包。
+- 活动 Gateway 放在三角形外，距各节点约 2–4 m，作为专用 AP 持续发包。
 - 当前模型面向单人走动，不承诺检测完全静止人员。
 - 三角形边线内外各 30 cm 作为不计验收指标的过渡带。
 
-连接 GW-02 到上位机后，在仪表盘点击“区域标定”，按顺序完成空场 60 秒、内部走动 180 秒、外部走动 180 秒。上位机使用稳健中位数/MAD 标准化、Fisher 特征选择和加权 k-NN（k=7）训练现场配置，并绑定 GW-02 与三个 Node STA MAC。配置默认保存到 `%APPDATA%\EchoGuard\triangle_calibration_gw02.json`。
+连接活动 Gateway 到上位机后，在仪表盘点击“区域标定”，按顺序完成空场 60 秒、内部走动 180 秒、外部走动 180 秒。上位机根据真实 `gateway_status`（缺省时回退 `csi_features` 帧）自动识别 GW-01/GW-02，使用稳健中位数/MAD 标准化、Fisher 特征选择和加权 k-NN（k=7）训练现场配置，并绑定该 Gateway 与三个 Node STA MAC。两个 Gateway 的配置分别保存到 `%APPDATA%\EchoGuard\triangle_calibration_gw01.json` 与 `%APPDATA%\EchoGuard\triangle_calibration_gw02.json`，互不覆盖；切换 Gateway 后旧缓存、概率和迟滞计数自动重置。
 
 标定交叉验证目标为内部检出率不低于 95%、空场和外部合计误报率不高于 5%；未达到目标时不会启用该配置。运行时连续 2 个窗口确认进入，连续 3 个窗口确认清除；链路缺失、设备 MAC 不匹配或持续离群时显示“数据不足/需要重新标定”，而不是猜测有人或无人。
 
@@ -242,9 +242,9 @@ powershell -ExecutionPolicy Bypass -File scripts\package_releases.ps1
 
 ```text
 dist/
-+-- EchoGuard-v0.5.0-windows/
++-- EchoGuard-v0.5.1-windows/
 |   +-- EchoGuard.exe
-+-- EchoGuard-Mobile-v0.5.0-windows/
++-- EchoGuard-Mobile-v0.5.1-windows/
     +-- EchoGuard.exe
 ```
 

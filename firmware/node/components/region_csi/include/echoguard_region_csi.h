@@ -14,7 +14,7 @@ extern "C" {
 
 esp_err_t echoguard_region_csi_init(uint8_t node_id);
 
-void echoguard_region_csi_set_gateway(const uint8_t bssid[6], bool gw02_connected);
+void echoguard_region_csi_set_gateway(const uint8_t bssid[6], bool gateway_connected);
 
 void echoguard_region_csi_set_disconnected(void);
 

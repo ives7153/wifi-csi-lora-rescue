@@ -50,7 +50,7 @@ try:
         save_ui_settings,
     )
     from ..data_parser import parse_gateway_frame
-    from ..region_detection import CalibrationError, TriangleRegionDetector
+    from ..region_detection import SUPPORTED_GATEWAY_IDS, CalibrationError, TriangleRegionDetector
     from ..ai import (
         AISettings,
         LocalJinaRuntime,
@@ -114,7 +114,7 @@ except ImportError:  # 兼容在 upper_computer 目录下直接 python main.py
         save_ui_settings,
     )
     from data_parser import parse_gateway_frame
-    from region_detection import CalibrationError, TriangleRegionDetector
+    from region_detection import SUPPORTED_GATEWAY_IDS, CalibrationError, TriangleRegionDetector
     from ai import (  # type: ignore
         AISettings,
         LocalJinaRuntime,
@@ -464,6 +464,10 @@ class DataManager(QObject):
             "total_csi_features": 0,
         }
         self._gateway_status: dict[str, Any] = {}
+        # 权威活动 Gateway 依据：只有真实串口 gateway_status 可设置；
+        # csi_features 仅在尚无受信 status 时作为回退学习来源。
+        self._authoritative_gateway_id: str | None = None
+        self._last_region_warning_at = 0.0
         self._dirty = True
         self._active_node = 0
         self._paused = False
@@ -1354,6 +1358,12 @@ class DataManager(QObject):
         self._serial_connected = False
         self._last_serial_sample_at = 0.0
         self._startup_presence_demo_started_at.clear()
+        # 断开即失去权威 Gateway 依据：清空权威选择与区域运行时状态，
+        # 但保留已加载 profile；后续真实 status 或 CSI 回退可干净重建上下文。
+        self._authoritative_gateway_id = None
+        self._gateway_status = {}
+        self.region_detector.reset_runtime(status="insufficient")
+        self._dirty = True
 
         worker = self._worker
         thread = self._thread
@@ -1498,6 +1508,11 @@ class DataManager(QObject):
                 self._gateway_status = dict(payload)
                 self._gateway_status["received_at"] = time.time()
                 self._dirty = True
+                # 只信任真实串口状态帧；回放/演示不得驱动区域 Gateway 上下文。
+                if _canonical_sample_source(frame.get("source")) == "serial_real":
+                    self._apply_authoritative_gateway_status(
+                        str(payload.get("gateway_id") or ""), now=time.time()
+                    )
         total = int(batch_stats.get("total") or len(all_valid_frames))
         invalid = int(batch_stats.get("invalid") or 0)
         dropped = int(batch_stats.get("dropped") or 0)
@@ -1519,12 +1534,58 @@ class DataManager(QObject):
 
         now = time.time()
         if region_frames:
-            for frame in region_frames:
-                # 录制回放和手机演示不得驱动真实区域判定；这里只接受串口实时特征。
-                if _canonical_sample_source(frame.get("source")) != "serial_real":
-                    continue
-                if self.region_detector.ingest(frame, now=now):
+            serial_region_frames = [
+                frame
+                for frame in region_frames
+                if _canonical_sample_source(frame.get("source")) == "serial_real"
+            ]
+            if serial_region_frames:
+                batch_gateways = {
+                    str(frame.get("gateway_id") or "").strip().upper()
+                    for frame in serial_region_frames
+                }
+                supported_in_batch = sorted(
+                    batch_gateways & set(SUPPORTED_GATEWAY_IDS)
+                )
+                unsupported_in_batch = sorted(
+                    gateway for gateway in batch_gateways
+                    if gateway not in SUPPORTED_GATEWAY_IDS
+                )
+                if len(supported_in_batch) > 1:
+                    # 同一批次混入多个 Gateway：不切换、不摄入任何帧，
+                    # 清空区域运行时状态并报告数据不足，绝不拼成 9/9。
+                    self.region_detector.reset_runtime(
+                        status="gateway_switching", now=now
+                    )
                     self._dirty = True
+                    self._append_region_warning(
+                        "REGION GATEWAY MIXED",
+                        "同一批次混入多个 Gateway 的区域帧，已停止判定并清空区域状态",
+                        now=now,
+                    )
+                elif unsupported_in_batch:
+                    # 未知来源与受支持来源同批时也整体拒绝，避免帧顺序决定最终状态；
+                    # 清空标定采样属于安全行为，但必须留下可见告警。
+                    self.region_detector.reset_runtime(
+                        status="unsupported_gateway", now=now
+                    )
+                    self._dirty = True
+                    self._append_region_warning(
+                        "REGION GATEWAY UNSUPPORTED",
+                        "区域帧包含不支持的 Gateway ID：{}，已拒绝整批数据并清空区域状态".format(
+                            ", ".join(value or "空" for value in unsupported_in_batch)
+                        ),
+                        now=now,
+                    )
+                else:
+                    fallback_gateway = supported_in_batch[0] if supported_in_batch else ""
+                    if fallback_gateway and self._authoritative_gateway_id is None:
+                        # CSI 回退学习仅在尚无受信 status 时生效；
+                        # 受信 status 下不匹配的 CSI 会被检测器直接拒绝。
+                        self._fallback_learn_gateway(fallback_gateway, now=now)
+                    for frame in serial_region_frames:
+                        if self.region_detector.ingest(frame, now=now):
+                            self._dirty = True
             self._consume_region_transition(now)
 
         if not valid_frames:
@@ -1594,6 +1655,78 @@ class DataManager(QObject):
         if applied:
             self._dirty = True
 
+    def _append_region_warning(self, title: str, message: str, *, now: float | None = None) -> None:
+        """区域状态警告事件节流，避免异常帧高频刷屏事件流。"""
+
+        current = time.time() if now is None else float(now)
+        if current - self._last_region_warning_at < 1.0:
+            return
+        self._last_region_warning_at = current
+        self._append_event(title, message, level="WARN", kind="region")
+
+    def _apply_authoritative_gateway_status(self, gateway_id: str, *, now: float | None = None) -> None:
+        """真实串口 gateway_status 是当前连接的权威 Gateway 来源。
+
+        支持 GW-01/GW-02 时切换检测器上下文；未知 ID 清空权威选择并
+        将区域状态置为不支持的 Gateway，绝不残留旧概率或判定。
+        """
+
+        gateway_id = str(gateway_id or "").strip().upper()
+        if gateway_id in SUPPORTED_GATEWAY_IDS:
+            if gateway_id == self._authoritative_gateway_id:
+                # 未知/错配 CSI 可能已清空运行时，但不能压过后续再次确认的
+                # 真实 status。立即恢复到已知 Gateway 的等待数据状态。
+                if (
+                    self.region_detector.gateway_id == gateway_id
+                    and self.region_detector.status
+                    in {"unsupported_gateway", "gateway_mismatch"}
+                ):
+                    self.region_detector.reset_runtime(
+                        status="gateway_switching", now=now
+                    )
+                    self._dirty = True
+                return
+            self._authoritative_gateway_id = gateway_id
+            self._dirty = True
+            if self.region_detector.set_gateway(gateway_id, now=now):
+                self._append_event(
+                    "REGION GATEWAY SWITCHED",
+                    f"已识别活动 Gateway {gateway_id}，区域标定上下文已切换并重置",
+                    level="WARN",
+                    kind="region",
+                )
+            return
+        already_unsupported = (
+            self._authoritative_gateway_id is None
+            and self.region_detector.status == "unsupported_gateway"
+        )
+        self._authoritative_gateway_id = None
+        self.region_detector.reset_runtime(status="unsupported_gateway", now=now)
+        self._dirty = True
+        if not already_unsupported:
+            self._append_region_warning(
+                "REGION GATEWAY UNSUPPORTED",
+                f"不支持的 Gateway ID：{gateway_id or '空'}，已清空区域判定状态",
+                now=now,
+            )
+
+    def _fallback_learn_gateway(self, gateway_id: str, *, now: float | None = None) -> None:
+        """尚无受信 gateway_status 时，以真实 csi_features 帧回退识别活动 Gateway。"""
+
+        gateway_id = str(gateway_id or "").strip().upper()
+        if gateway_id not in SUPPORTED_GATEWAY_IDS:
+            return
+        if self.region_detector.gateway_id == gateway_id:
+            return
+        if self.region_detector.set_gateway(gateway_id, now=now):
+            self._dirty = True
+            self._append_event(
+                "REGION GATEWAY SWITCHED",
+                f"已识别活动 Gateway {gateway_id}，区域标定上下文已切换并重置",
+                level="WARN",
+                kind="region",
+            )
+
     @pyqtSlot(str)
     def start_region_calibration_phase(self, phase: str) -> None:
         """开始空场、区域内部或区域外部标定阶段。"""
@@ -1621,10 +1754,11 @@ class DataManager(QObject):
 
     def _consume_region_transition(self, event_time: float | None = None) -> None:
         transition = self.region_detector.consume_transition()
+        gateway_id = self.region_detector.gateway_id
         if transition == "occupied":
             self._append_event(
                 "REGION OCCUPIED",
-                "GW-02 三角形区域内检测到走动人员",
+                f"{gateway_id} 三角形区域内检测到走动人员",
                 level="ALARM",
                 kind="region",
                 event_time=event_time,
@@ -1632,7 +1766,7 @@ class DataManager(QObject):
         elif transition == "clear":
             self._append_event(
                 "REGION CLEAR",
-                "GW-02 三角形区域已恢复无人状态",
+                f"{gateway_id} 三角形区域已恢复无人状态",
                 level="OK",
                 kind="region",
                 event_time=event_time,

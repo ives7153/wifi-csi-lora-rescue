@@ -53,7 +53,7 @@
 #define WIFI_RESELECT_DELAY_MS          2000
 #define WIFI_CONNECT_TIMEOUT_MS         12000
 #define WIFI_PRIMARY_FAILURE_LIMIT      3
-#define NODE_FIRMWARE_VERSION           "v0.5.1"
+#define NODE_FIRMWARE_VERSION           "v0.5.2"
 
 /* FreeRTOS 任务参数：本固件只创建 3 个业务任务，优先级与栈大小集中写在这里便于现场调整。 */
 #define WIFI_TASK_STACK_SIZE            6144
@@ -511,10 +511,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
 
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_CONNECTED) {
         wifi_event_sta_connected_t *connected = (wifi_event_sta_connected_t *)event_data;
-        echoguard_region_csi_set_gateway(
-            connected->bssid,
-            s_selected_gateway == WIFI_GATEWAY_SECONDARY
-        );
+        echoguard_region_csi_set_gateway(connected->bssid, true);
         return;
     }
 
@@ -621,7 +618,7 @@ static void region_feature_upload_task(void *arg)
     while (true) {
         xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT,
                             pdFALSE, pdTRUE, portMAX_DELAY);
-        if (s_connected_gateway != WIFI_GATEWAY_SECONDARY || s_gateway_ip_addr == 0U) {
+        if (s_connected_gateway == WIFI_GATEWAY_NONE || s_gateway_ip_addr == 0U) {
             vTaskDelay(pdMS_TO_TICKS(500));
             continue;
         }
@@ -636,7 +633,7 @@ static void region_feature_upload_task(void *arg)
         ESP_LOGI(TAG, "triangle region feature uplink ready: gateway=%s port=%u",
                  wifi_gateway_name(s_connected_gateway), ECHOGUARD_REGION_FEATURE_PORT);
         while ((xEventGroupGetBits(s_wifi_event_group) & WIFI_CONNECTED_BIT) != 0 &&
-               s_connected_gateway == WIFI_GATEWAY_SECONDARY) {
+               s_connected_gateway != WIFI_GATEWAY_NONE) {
             echoguard_region_packet_t packet = {0};
             if (!echoguard_region_csi_snapshot(&packet)) {
                 vTaskDelay(pdMS_TO_TICKS(500));

@@ -9,7 +9,7 @@
 - 节点是否存在，以 Gateway 收到该节点 LoRa 帧并通过 USB 串口输出有效 JSON 为准。
 - 实时主判断由多节点规则融合完成，AI 只做异步辅助解释，不接管实时判断。
 - Mobile 演示覆盖和文件回放必须携带明确数据来源，不伪装成实时 Gateway 数据。
-- 三角形区域检测只接受 GW-02 实时 `csi_features` 帧；Mobile 覆盖、启动演示和录制回放均不得驱动区域状态。
+- 三角形区域检测只接受当前活动 Gateway（GW-01 或 GW-02）的实时 `csi_features` 帧；上位机从真实 `gateway_status`（缺省回退 `csi_features` 帧）识别活动 Gateway 并加载其独立标定配置。现场每次只开启一个 Gateway，切换前先关闭当前 Gateway。Mobile 覆盖、启动演示和录制回放均不得驱动区域状态。
 
 ## 固件到上位机的数据链路
 
@@ -65,7 +65,7 @@ Gateway 每 10 秒额外输出一条状态 JSON，用于链路诊断，不会创
 }
 ```
 
-GW-02 区域模式还会转发独立的 CSI 特征 JSON。每个 Node 帧包含本机 STA MAC 和 3 条接收链路；三节点合计覆盖 3 条 Gateway→Node 链路与 6 条有方向的 Node→Node 链路：
+活动 Gateway（GW-01 或 GW-02）在区域模式还会转发独立的 CSI 特征 JSON，字段结构一致，`gateway_id` 区分来源。每个 Node 帧包含本机 STA MAC 和 3 条接收链路；三节点合计覆盖 3 条 Gateway→Node 链路与 6 条有方向的 Node→Node 链路：
 
 ```json
 {
@@ -190,3 +190,6 @@ Gateway JSON 中的 `gas` 仍保持固件协议语义：MQ-135 ADC 原始值。�
 - 注入或接入两个 presence 达到用户阈值的节点后，综合研判应显示 `多节点疑似生命微动`。
 - Gateway 状态帧不得创建 `node0`，诊断报告应显示 LoRa CRC、异常长度和队列丢包计数。
 - 手机覆盖、演示和回放数据必须在历史记录与 CSV 中显示正确来源。
+- 上位机只接受 GW-01/GW-02 的真实串口 `csi_features` 帧；未知 Gateway ID 显示“不支持的 Gateway”，不输出有人/无人结论。
+- 混入两个 Gateway 的区域帧不会拼成 9/9；活动 Gateway 切换后旧缓存、概率和迟滞计数自动重置。
+- 每个 Gateway 使用独立标定文件（`triangle_calibration_gw01.json` / `triangle_calibration_gw02.json`），设备身份与标定配置互不污染。

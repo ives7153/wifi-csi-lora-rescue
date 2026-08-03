@@ -16,7 +16,10 @@ from pathlib import Path
 from typing import Any
 
 PROFILE_VERSION = 1
-EXPECTED_GATEWAY_ID = "GW-02"
+DEFAULT_GATEWAY_ID = "GW-02"
+# 向后兼容别名：旧代码仍可导入 EXPECTED_GATEWAY_ID 得到默认 Gateway。
+EXPECTED_GATEWAY_ID = DEFAULT_GATEWAY_ID
+SUPPORTED_GATEWAY_IDS = ("GW-01", "GW-02")
 EXPECTED_NODE_IDS = (1, 2, 3)
 EXPECTED_LINKS = {
     1: (0, 2, 3),
@@ -69,11 +72,28 @@ class RegionProfile:
         )
 
 
-def default_profile_path() -> Path:
+def profile_path_for_gateway(gateway_id: str = DEFAULT_GATEWAY_ID) -> Path:
+    """返回指定 Gateway 的独立标定文件路径（同一 EchoGuard APPDATA 目录）。"""
+
+    gateway_id = str(gateway_id or DEFAULT_GATEWAY_ID).strip().upper()
+    filename = f"triangle_calibration_{gateway_id.lower().replace('-', '')}.json"
     appdata = os.environ.get("APPDATA")
     if appdata:
-        return Path(appdata) / "EchoGuard" / "triangle_calibration_gw02.json"
-    return Path.home() / ".echoguard" / "triangle_calibration_gw02.json"
+        return Path(appdata) / "EchoGuard" / filename
+    return Path.home() / ".echoguard" / filename
+
+
+def default_profile_path(gateway_id: str | None = None) -> Path:
+    """GW-02 默认兼容路径；可显式传入 Gateway ID 得到对应独立 profile。"""
+
+    return profile_path_for_gateway(gateway_id)
+
+
+def _normalize_gateway_id(value: Any) -> str:
+    gateway_id = str(value or DEFAULT_GATEWAY_ID).strip().upper()
+    if gateway_id not in SUPPORTED_GATEWAY_IDS:
+        raise CalibrationError(f"不支持的 Gateway: {gateway_id}")
+    return gateway_id
 
 
 def _median(values: list[float]) -> float:
@@ -180,8 +200,11 @@ def _transform_with_feature_space(
 class TriangleRegionDetector:
     """组装九条链路、执行现场标定并输出带迟滞的全局区域状态。"""
 
-    def __init__(self, profile_path: Path | None = None) -> None:
-        self.profile_path = profile_path or default_profile_path()
+    def __init__(self, profile_path: Path | None = None, gateway_id: str | None = None) -> None:
+        # 显式 Gateway 上下文；缺省保留 GW-02 默认以兼容既有调用方。
+        self.gateway_id = _normalize_gateway_id(gateway_id)
+        self._explicit_profile_path = profile_path is not None
+        self.profile_path = profile_path or default_profile_path(self.gateway_id)
         self.profile: RegionProfile | None = None
         self.latest_frames: dict[int, dict[str, Any]] = {}
         self.node_macs: dict[int, str] = {}
@@ -204,6 +227,52 @@ class TriangleRegionDetector:
         self.last_transition = ""
         self._load_profile()
 
+    def set_gateway(self, gateway_id: str, *, now: float | None = None) -> bool:
+        """切换到显式支持的 Gateway 上下文并重置全部检测状态。
+
+        切换后进入“网关切换中/数据不足”，等待新 Gateway 的完整九链路特征；
+        若该 Gateway 已有标定配置则同步加载，profile 与设备身份互不污染。
+        """
+
+        gateway_id = str(gateway_id or "").strip().upper()
+        if gateway_id not in SUPPORTED_GATEWAY_IDS:
+            return False
+        if gateway_id == self.gateway_id:
+            return True
+        self.gateway_id = gateway_id
+        if not self._explicit_profile_path:
+            self.profile_path = default_profile_path(gateway_id)
+        self.profile = None
+        self.reset_runtime(status="gateway_switching", now=now)
+        self._load_profile()
+        return True
+
+    def reset_runtime(self, status: str = "gateway_switching", *, now: float | None = None) -> None:
+        """清空区域运行时状态，保留 Gateway 上下文与已加载 profile。
+
+        DataManager 在未知 Gateway、混合批次或串口断开时调用本 API，确保
+        旧缓存、概率、迟滞和标定采样不会残留到下一次连接。
+        """
+
+        self.latest_frames = {}
+        self.node_macs = {}
+        self.last_feature_at = 0.0
+        self.last_vector_at = 0.0
+        self.current_phase = ""
+        self.phase_deadline = 0.0
+        self.completed_phases = []
+        self.samples = {phase: [] for phase in PHASE_ORDER}
+        self.calibration_error = ""
+        self.confidence = 0.0
+        self.inside_probability = 0.0
+        self.valid_links = 0
+        self.inside_streak = 0
+        self.outside_streak = 0
+        self.outlier_streak = 0
+        self.last_transition = ""
+        self.status = status
+        self.updated_at = time.time() if now is None else float(now)
+
     def _load_profile(self) -> None:
         try:
             payload = json.loads(self.profile_path.read_text(encoding="utf-8"))
@@ -212,7 +281,7 @@ class TriangleRegionDetector:
             return
         if (
             profile.version != PROFILE_VERSION
-            or profile.gateway_id != EXPECTED_GATEWAY_ID
+            or profile.gateway_id != self.gateway_id
             or not profile.selected_indices
             or not profile.train_vectors
             or len(profile.train_vectors) != len(profile.train_labels)
@@ -238,7 +307,7 @@ class TriangleRegionDetector:
         if self.current_phase:
             raise CalibrationError("当前标定阶段尚未结束")
         if not self._identity_ready():
-            raise CalibrationError("尚未收到GW-02三个节点的完整九链路特征")
+            raise CalibrationError(f"尚未收到{self.gateway_id}三个节点的完整九链路特征")
 
         self.samples[phase] = []
         self.current_phase = phase
@@ -258,8 +327,14 @@ class TriangleRegionDetector:
 
     def ingest(self, frame: dict[str, Any], *, now: float | None = None) -> bool:
         current = time.time() if now is None else float(now)
-        if str(frame.get("gateway_id") or "") != EXPECTED_GATEWAY_ID:
+        frame_gateway = str(frame.get("gateway_id") or "").strip().upper()
+        if frame_gateway not in SUPPORTED_GATEWAY_IDS:
+            # 未知 Gateway 帧必须清空旧状态，绝不允许残留占位概率。
+            self.reset_runtime(status="unsupported_gateway", now=current)
+            return True
+        if frame_gateway != self.gateway_id:
             self.status = "gateway_mismatch"
+            self.valid_links = 0
             self.updated_at = current
             return True
         node_id = int(frame.get("node_id") or 0)
@@ -377,7 +452,9 @@ class TriangleRegionDetector:
             "calibration_ready_next": "等待下一阶段",
             "calibration_failed": "标定未通过",
             "insufficient": "数据不足",
-            "gateway_mismatch": "需要GW-02",
+            "gateway_switching": "网关切换中，数据不足",
+            "unsupported_gateway": "不支持的 Gateway",
+            "gateway_mismatch": f"需要{self.gateway_id}",
             "profile_mismatch": "设备与标定不匹配",
             "needs_recalibration": "需要重新标定",
             "occupied": "区域内有人",
@@ -390,7 +467,7 @@ class TriangleRegionDetector:
             "inside_probability": self.inside_probability,
             "valid_links": self.valid_links,
             "updated_at": self.updated_at,
-            "gateway_id": EXPECTED_GATEWAY_ID,
+            "gateway_id": self.gateway_id,
             "profile_loaded": self.profile is not None,
             "profile_path": str(self.profile_path),
             "metrics": dict(self.validation_metrics),
@@ -558,7 +635,7 @@ class TriangleRegionDetector:
 
         profile = RegionProfile(
             version=PROFILE_VERSION,
-            gateway_id=EXPECTED_GATEWAY_ID,
+            gateway_id=self.gateway_id,
             node_macs={str(node): mac for node, mac in sorted(self.node_macs.items())},
             channel=6,
             created_at=time.time(),

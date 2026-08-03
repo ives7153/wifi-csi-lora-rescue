@@ -679,7 +679,7 @@ class AISettingsDialog(QDialog):
 # 仪表盘页（图 2）
 # ===========================================================================
 class RegionCalibrationDialog(QDialog):
-    """GW-02 三角形区域三阶段现场标定向导。"""
+    """活动 Gateway 三角形区域三阶段现场标定向导。"""
 
     phase_requested = pyqtSignal(str)
     cancel_requested = pyqtSignal()
@@ -692,7 +692,8 @@ class RegionCalibrationDialog(QDialog):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("三角形区域标定 · GW-02")
+        self.gateway_id = "GW-02"
+        self.setWindowTitle(f"三角形区域标定 · {self.gateway_id}")
         self.setModal(False)
         self.resize(620, 430)
         self.setMinimumSize(560, 390)
@@ -703,14 +704,14 @@ class RegionCalibrationDialog(QDialog):
         layout.setSpacing(14)
         title = QLabel("三角形区域现场标定")
         title.setObjectName("PageTitle")
-        intro = QLabel(
-            "仅使用 GW-02 和 Node 1/2/3 的真实九链路 CSI。请按顺序完成三阶段；"
+        self.intro = QLabel(
+            f"仅使用 {self.gateway_id} 和 Node 1/2/3 的真实九链路 CSI。请按顺序完成三阶段；"
             "标定期间手机演示值不会参与区域判定。"
         )
-        intro.setWordWrap(True)
-        intro.setObjectName("SubtleText")
+        self.intro.setWordWrap(True)
+        self.intro.setObjectName("SubtleText")
         layout.addWidget(title)
-        layout.addWidget(intro)
+        layout.addWidget(self.intro)
 
         self.status_label = QLabel("等待九链路数据")
         self.status_label.setStyleSheet(f"color: {THEME['blue_soft']}; font-size: 16px; font-weight: 700;")
@@ -756,6 +757,14 @@ class RegionCalibrationDialog(QDialog):
         layout.addLayout(footer)
 
     def update_region(self, region: dict[str, Any]) -> None:
+        gateway = str(region.get("gateway_id") or self.gateway_id).strip().upper()
+        if gateway and gateway != self.gateway_id:
+            self.gateway_id = gateway
+            self.setWindowTitle(f"三角形区域标定 · {self.gateway_id}")
+            self.intro.setText(
+                f"仅使用 {self.gateway_id} 和 Node 1/2/3 的真实九链路 CSI。请按顺序完成三阶段；"
+                "标定期间手机演示值不会参与区域判定。"
+            )
         calibration = region.get("calibration") if isinstance(region.get("calibration"), dict) else {}
         current = str(calibration.get("phase") or "")
         completed = {str(value) for value in calibration.get("completed") or []}
@@ -905,15 +914,15 @@ class DashboardPage(QWidget):
         region_layout.setContentsMargins(18, 12, 18, 12)
         region_layout.setSpacing(18)
         region_title_box = QVBoxLayout()
-        region_title = QLabel("三角形区域检测 · GW-02")
-        region_title.setObjectName("SectionTitle")
+        self.region_title = QLabel("三角形区域检测 · GW-02")
+        self.region_title.setObjectName("SectionTitle")
         region_hint = QLabel("9 条定向 CSI 链路 · 单人走动 · 边线 ±30 cm 为过渡带")
         region_hint.setObjectName("SubtleText")
-        region_title_box.addWidget(region_title)
+        region_title_box.addWidget(self.region_title)
         region_title_box.addWidget(region_hint)
         self.region_status = QLabel("未标定")
         self.region_status.setObjectName("MetricValue")
-        self.region_detail = QLabel("等待 GW-02 与三个节点的完整特征")
+        self.region_detail = QLabel("等待活动 Gateway 与三个节点的完整特征")
         self.region_detail.setObjectName("SubtleText")
         self.region_detail.setWordWrap(True)
         region_status_box = QVBoxLayout()
@@ -1169,9 +1178,11 @@ class DashboardPage(QWidget):
         self._latest_region = dict(region)
         status = str(region.get("status") or "not_calibrated")
         label = str(region.get("label") or "未标定")
+        gateway = str(region.get("gateway_id") or "GW-02").strip().upper()
         links = int(region.get("valid_links") or 0)
         probability = max(0.0, min(float(region.get("inside_probability") or 0.0), 1.0))
         calibration = region.get("calibration") if isinstance(region.get("calibration"), dict) else {}
+        self.region_title.setText(f"三角形区域检测 · {gateway}")
         if status == "calibrating":
             detail = f"{calibration.get('phase_label') or '现场'}采集中 · 有效链路 {links}/9"
             color = THEME["orange"]
@@ -1184,8 +1195,11 @@ class DashboardPage(QWidget):
         elif status in {"calibration_failed", "profile_mismatch", "needs_recalibration", "gateway_mismatch"}:
             detail = str(calibration.get("error") or f"有效链路 {links}/9，请检查设备或重新标定")
             color = THEME["red"]
+        elif status in {"gateway_switching", "unsupported_gateway"}:
+            detail = f"{label} · 有效链路 {links}/9"
+            color = THEME["orange"]
         else:
-            detail = f"有效链路 {links}/9 · 需要 GW-02 与 Node 1/2/3"
+            detail = f"有效链路 {links}/9 · 需要 {gateway} 与 Node 1/2/3"
             color = THEME["blue_soft"]
         self.region_status.setText(label)
         self.region_status.setStyleSheet(f"color: {color}; font-size: 24px; font-weight: 800;")
