@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -69,6 +70,32 @@ class RepositoryConsistencyTests(unittest.TestCase):
             and path.suffix in {".c", ".h", ".txt"}
         )
         self.assertNotIn("echoguard_ota", node_sources)
+
+    def test_node_project_and_startup_versions_agree_at_0_5_1(self) -> None:
+        cmake = (ROOT / "firmware" / "node" / "CMakeLists.txt").read_text(encoding="utf-8")
+        project_ver = re.search(r'set\(PROJECT_VER\s+"([^"]+)"\)', cmake)
+        self.assertIsNotNone(project_ver, "PROJECT_VER missing in firmware/node/CMakeLists.txt")
+        self.assertEqual(project_ver.group(1), "0.5.1")
+
+        main_c = (ROOT / "firmware" / "node" / "main" / "main.c").read_text(encoding="utf-8")
+        startup_ver = re.search(r'#define\s+NODE_FIRMWARE_VERSION\s+"v([^"]+)"', main_c)
+        self.assertIsNotNone(startup_ver, "NODE_FIRMWARE_VERSION missing in firmware/node/main/main.c")
+        self.assertEqual(startup_ver.group(1), "0.5.1")
+        self.assertEqual(
+            startup_ver.group(1),
+            project_ver.group(1),
+            "Node CMake PROJECT_VER and runtime NODE_FIRMWARE_VERSION disagree",
+        )
+        self.assertIn(
+            'EchoGuard Node %s WiFi multi-link CSI + Sensor Fusion starting",\n'
+            "             NODE_FIRMWARE_VERSION);",
+            main_c,
+        )
+        self.assertEqual(
+            main_c.count("v0.5.1"),
+            1,
+            "Node startup version must be reported via NODE_FIRMWARE_VERSION, not hard-coded",
+        )
 
 
 if __name__ == "__main__":

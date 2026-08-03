@@ -53,6 +53,7 @@
 #define WIFI_RESELECT_DELAY_MS          2000
 #define WIFI_CONNECT_TIMEOUT_MS         12000
 #define WIFI_PRIMARY_FAILURE_LIMIT      3
+#define NODE_FIRMWARE_VERSION           "v0.5.1"
 
 /* FreeRTOS 任务参数：本固件只创建 3 个业务任务，优先级与栈大小集中写在这里便于现场调整。 */
 #define WIFI_TASK_STACK_SIZE            6144
@@ -269,7 +270,8 @@ static uint8_t clamp_u8_int(int value);
 void app_main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
-    ESP_LOGI(TAG, "EchoGuard Node v0.4.0 WiFi multi-link CSI + Sensor Fusion starting");
+    ESP_LOGI(TAG, "EchoGuard Node %s WiFi multi-link CSI + Sensor Fusion starting",
+             NODE_FIRMWARE_VERSION);
     ESP_LOGI(TAG, "任务优先级: wifi_sta=%d, csi_sensor=%d, lora_send=%d",
              WIFI_TASK_PRIORITY, CSI_SENSOR_TASK_PRIORITY, LORA_SEND_TASK_PRIORITY);
 
