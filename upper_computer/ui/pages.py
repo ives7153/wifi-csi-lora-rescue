@@ -2683,6 +2683,7 @@ class DiagnosticsPage(QWidget):
     """链路质量诊断 + 系统信息。"""
 
     diagnostics_requested = pyqtSignal()
+    gateway_ota_requested = pyqtSignal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -2709,8 +2710,12 @@ class DiagnosticsPage(QWidget):
         copy_btn = QPushButton("复制报告")
         copy_btn.setObjectName("GhostButton")
         copy_btn.clicked.connect(self._copy_report)
+        ota_btn = QPushButton("Gateway 01 OTA")
+        ota_btn.setObjectName("GhostButton")
+        ota_btn.clicked.connect(self.gateway_ota_requested.emit)
         actions.addWidget(run_btn)
         actions.addWidget(copy_btn)
+        actions.addWidget(ota_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
 

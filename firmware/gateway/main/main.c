@@ -16,6 +16,7 @@
 #include "esp_wifi.h"
 #include "echoguard_protocol.h"
 #include "echoguard_lora.h"
+#include "echoguard_ota.h"
 #include "echoguard_region_protocol.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
@@ -38,7 +39,7 @@
 #define WIFI_SOFTAP_SSID          CONFIG_ECHOGUARD_GATEWAY_SSID
 #define WIFI_SOFTAP_PASSWORD      CONFIG_ECHOGUARD_WIFI_PASSWORD
 #define GATEWAY_ID                CONFIG_ECHOGUARD_GATEWAY_ID
-#define GATEWAY_FIRMWARE_VERSION  "v0.4.0"
+#define GATEWAY_FIRMWARE_VERSION  "v0.5.0"
 #define WIFI_SOFTAP_CHANNEL       6
 #define WIFI_SOFTAP_MAX_CONN      4
 
@@ -206,6 +207,13 @@ static void wifi_softap_task(void *arg)
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20));
     xEventGroupSetBits(s_wifi_event_group, WIFI_AP_STARTED_BIT);
+
+#ifdef CONFIG_ECHOGUARD_OTA_ENABLED
+    esp_err_t ota_result = echoguard_ota_start();
+    if (ota_result != ESP_OK) {
+        ESP_LOGE(TAG, "Gateway OTA server failed to start: %s", esp_err_to_name(ota_result));
+    }
+#endif
 
     ESP_LOGI(TAG, "SoftAP started, ssid=%s, channel=%d, auth=WPA2-PSK",
              WIFI_SOFTAP_SSID, WIFI_SOFTAP_CHANNEL);
@@ -400,6 +408,9 @@ static void lora_receive_task(void *arg)
     }
 
     ESP_LOGI(TAG, "SX1278 receive mode ready: 433MHz BW125 SF7 CR4/5");
+#ifdef CONFIG_ECHOGUARD_OTA_ENABLED
+    echoguard_ota_notify_lora_ready();
+#endif
 
     while (true) {
         rescue_lora_packet_t packet = {0};
@@ -575,9 +586,17 @@ static void nvs_init_for_wifi(void)
 void app_main(void)
 {
     serial_console_init();
-    ESP_LOGI(TAG, "EchoGuard Gateway v0.4.0 LoRa + triangle region bridge starting");
+#ifdef CONFIG_ECHOGUARD_OTA_ENABLED
+    ESP_LOGI(TAG, "EchoGuard Gateway v0.5.0 LoRa + triangle region bridge + LAN OTA starting");
+#else
+    ESP_LOGI(TAG, "EchoGuard Gateway v0.5.0 LoRa + triangle region bridge starting");
+#endif
 
     nvs_init_for_wifi();
+
+#ifdef CONFIG_ECHOGUARD_OTA_ENABLED
+    ESP_ERROR_CHECK(echoguard_ota_init(GATEWAY_ID));
+#endif
 
     s_wifi_event_group = xEventGroupCreate();
     s_lora_queue = xQueueCreate(LORA_QUEUE_LENGTH, sizeof(rescue_lora_packet_t));

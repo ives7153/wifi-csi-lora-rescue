@@ -20,4 +20,20 @@ menu "EchoGuard Gateway Configuration"
             WPA2 password shared with Rescue Nodes. The value is never printed
             to the runtime log.
 
+    config ECHOGUARD_OTA_ENABLED
+        bool "Enable Gateway LAN OTA service"
+        default n
+        help
+            Enable the authenticated HTTP OTA service for this Gateway build.
+            Keep this disabled for Nodes and Gateway 02.
+
+    config ECHOGUARD_OTA_TOKEN
+        string "Gateway LAN OTA token"
+        depends on ECHOGUARD_OTA_ENABLED
+        default ""
+        help
+            Local authentication token required by the OTA upload endpoint.
+            Set a value of at least 16 characters in an ignored local sdkconfig;
+            never commit the token to Git.
+
 endmenu

@@ -32,7 +32,7 @@ EchoGuard 由三部分组成：
 - 数据导出能力：支持 CSV 导出、融合扰动曲线截图和整窗截图，导出/截图结果通过右上角 toast 弹窗提示。
 - AI 辅助研判与问答：仪表盘显示短摘要，`AI 辅助` 页提供结构化研判、右侧上下文栏和 Markdown 对话；本地 Jina GGUF embedding 用于向量检索，可选大模型 API 用于联网生成回答，AI 不接管实时判断。
 - 数据录制回放：保留原始 Gateway JSON Lines 和接收时间，回放数据明确标记来源，不与实时数据混淆。
-- 双发行版：普通监测版与无密码手机演示控制版共用 v0.4.0 核心代码、真实区域检测器和 PyInstaller 打包流程；手机演示值与区域判定严格隔离。
+- 双发行版：普通监测版与无密码手机演示控制版共用 v0.5.0 核心代码、真实区域检测器和 PyInstaller 打包流程；手机演示值与区域判定严格隔离。
 
 ## 系统架构
 
@@ -109,7 +109,8 @@ wifi-csi-lora-rescue/
 |-- tests/                    # 测试与联调记录目录
 |-- upper_computer/           # PyQt6 上位机源码
 |-- EchoGuard.spec            # PyInstaller 打包配置
-|-- partitions-8Mib.csv       # ESP32-S3 分区表
+|-- partitions-8Mib.csv       # Node/GW-02 单应用分区表
+|-- partitions-ota-8Mib.csv   # GW-01 双槽 OTA 分区表
 +-- README.md
 ```
 
@@ -165,6 +166,22 @@ idf.py -p COMx flash monitor
 每个实体节点烧录前，需要在 `menuconfig -> Rescue Node Configuration -> Rescue node ID` 中设置唯一编号，例如 `1 / 2 / 3 / 4`。Gateway 串口输出中的 `id` 会直接作为上位机节点编号。
 
 Gateway 默认以 UART0（115200）作为主控制台，并将输出同步到 ESP32-S3 USB Serial/JTAG；因此带 CH340/CP210x 的自制板和带原生 USB 接口的开发板都可向上位机输出同一套 JSON Lines。
+
+### Gateway 01 局域网 OTA
+
+Gateway 01 的 OTA 只通过未跟踪的 `firmware/gateway/sdkconfig.gw01.local` 启用。该本地配置使用 `partitions-ota-8Mib.csv`、开启 Bootloader 回滚并保存独立 OTA 令牌；Node、GW-02 和默认 `partitions-8Mib.csv` 不启用 OTA。
+
+OTA 令牌不会进入 Git 跟踪的源码或公开配置，但会作为认证常量存在于本地编译出的 Gateway 应用镜像中。包含该镜像的首次安装包和 OTA 固件只能私下分发，不得上传为公开 GitHub Release 资产。
+
+使用本机 ESP-IDF 环境构建 GW-01 OTA 固件：
+
+```powershell
+cd firmware\gateway
+$env:PYTHONUTF8="1"
+idf.py -D SDKCONFIG=sdkconfig.gw01.local -B build-gw01-ota-v050 build
+```
+
+旧版单 `factory` 分区不能直接接收 OTA。首次安装必须通过 USB/串口完整写入 Bootloader、OTA 分区表、初始 OTA 数据和应用镜像；此后电脑连接 `EchoGuard-GW-01`，在上位机“技术诊断 -> Gateway 01 OTA”中选择新的 Gateway 应用 `.bin` 即可升级。上传会校验 Gateway 工程、ESP32-S3 目标、递增版本、SHA-256 和本地令牌；新固件只有在 SoftAP、HTTP OTA 服务和 LoRa 均就绪后才取消回滚。
 
 ## 三角形区域检测部署与标定
 
@@ -225,9 +242,9 @@ powershell -ExecutionPolicy Bypass -File scripts\package_releases.ps1
 
 ```text
 dist/
-+-- EchoGuard-v0.4.0-windows/
++-- EchoGuard-v0.5.0-windows/
 |   +-- EchoGuard.exe
-+-- EchoGuard-Mobile-v0.4.0-windows/
++-- EchoGuard-Mobile-v0.5.0-windows/
     +-- EchoGuard.exe
 ```
 

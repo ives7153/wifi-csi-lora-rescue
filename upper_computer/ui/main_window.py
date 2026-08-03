@@ -37,6 +37,7 @@ try:
         theme_mode,
     )
     from .components import StatusPill
+    from .gateway_ota_dialog import GatewayOTADialog
     from .icons import IconButton, SvgIcon, refresh_widget_icons
     from .pages import (
         AIAssistPage,
@@ -61,6 +62,7 @@ except ImportError:
         theme_mode,
     )
     from ui.components import StatusPill
+    from ui.gateway_ota_dialog import GatewayOTADialog
     from ui.icons import IconButton, SvgIcon, refresh_widget_icons
     from ui.pages import (
         AIAssistPage,
@@ -235,6 +237,7 @@ class MainWindow(QMainWindow):
         self._last_status_text = "串口状态：初始化中"
         self._last_status_ok = False
         self._latest_snapshot: dict[str, Any] | None = None
+        self._gateway_ota_dialog: GatewayOTADialog | None = None
 
         self._build_ui()
         self._wire_pages()
@@ -448,6 +451,7 @@ class MainWindow(QMainWindow):
         self.analysis_page.analysis_shot_requested.connect(self.analysis_shot_requested.emit)
         self.ai_assist_page.ai_action_requested.connect(self.ai_action_requested.emit)
         self.diagnostics_page.diagnostics_requested.connect(self.diagnostics_requested.emit)
+        self.diagnostics_page.gateway_ota_requested.connect(self._show_gateway_ota)
 
     # ------------------------------------------------------------------ 导航
     _SUBTITLE = {
@@ -530,6 +534,14 @@ class MainWindow(QMainWindow):
         )
         if path:
             self.replay_requested.emit(path)
+
+    def _show_gateway_ota(self) -> None:
+        if self._gateway_ota_dialog is None:
+            self._gateway_ota_dialog = GatewayOTADialog(self)
+        self._gateway_ota_dialog.refresh_theme()
+        self._gateway_ota_dialog.show()
+        self._gateway_ota_dialog.raise_()
+        self._gateway_ota_dialog.activateWindow()
 
     def _update_data_source_banner(self, snapshot: dict[str, Any]) -> None:
         config = snapshot.get("config") if isinstance(snapshot.get("config"), dict) else {}

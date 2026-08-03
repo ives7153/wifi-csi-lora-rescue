@@ -1,6 +1,6 @@
 # EchoGuard 上位机打包说明
 
-本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。v0.4.0 提供普通监测版和无密码手机演示控制版，两者共用数据、报警、AI、录制回放与导出核心。打包目标不包含 Jina GGUF 模型和 `llama-server.exe`。
+本文档说明如何把当前 PyQt 上位机打包为 Windows 可运行目录。v0.5.0 提供普通监测版和无密码手机演示控制版，两者共用数据、报警、AI、录制回放、Gateway 01 OTA 客户端与导出核心。打包目标不包含 Jina GGUF 模型和 `llama-server.exe`。
 
 ## 打包前检查
 
@@ -37,9 +37,9 @@ python -m PyInstaller --clean --noconfirm EchoGuard.spec
 
 ```text
 dist/
-├── EchoGuard-v0.4.0-windows/
+├── EchoGuard-v0.5.0-windows/
 │   └── EchoGuard.exe
-└── EchoGuard-Mobile-v0.4.0-windows/
+└── EchoGuard-Mobile-v0.5.0-windows/
     └── EchoGuard.exe
 ```
 
@@ -77,6 +77,7 @@ Jina 只作为本地 embedding/向量检索服务使用；AI 对话的自然语�
 - 窗口标题、任务栏名称和图标均为 `EchoGuard`。
 - 侧边导航图标和太阳/月亮主题按钮正常。
 - Gateway 串口可刷新、连接、显示最新帧。
+- 技术诊断页可打开 Gateway 01 OTA 窗口，离线时能明确提示连接失败且不阻塞主界面。
 - 节点收到数据后自动出现在仪表盘、节点管理、分析、历史和诊断页。
 - 环境状态中显示 `CO2 估算 ppm`，传感器页可执行当前节点校准和全部在线节点校准。
 - CSV 导出、历史记录导出、融合扰动曲线截图、整窗截图可写入 `upper_computer/exports/`，成功后右上角出现自动消失的 toast 提示。
@@ -97,8 +98,8 @@ powershell -ExecutionPolicy Bypass -File scripts\package_releases.ps1
 正式分发包命名为：
 
 ```text
-EchoGuard-v0.4.0-windows.zip
-EchoGuard-Mobile-v0.4.0-windows.zip
+EchoGuard-v0.5.0-windows.zip
+EchoGuard-Mobile-v0.5.0-windows.zip
 SHA256SUMS.txt
 ```
 

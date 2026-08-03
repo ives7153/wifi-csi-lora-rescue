@@ -47,7 +47,8 @@ $checksumLines = foreach ($archive in $archives) {
     $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
     "$hash  $($archive.Name)"
 }
-$checksumLines | Set-Content -LiteralPath $checksumPath -Encoding utf8NoBOM
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllLines($checksumPath, [string[]]$checksumLines, $utf8NoBom)
 
 Write-Host "Release packages created:"
 $archives | ForEach-Object { Write-Host "  $($_.FullName)" }
