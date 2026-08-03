@@ -39,7 +39,7 @@
 #define WIFI_SOFTAP_SSID          CONFIG_ECHOGUARD_GATEWAY_SSID
 #define WIFI_SOFTAP_PASSWORD      CONFIG_ECHOGUARD_WIFI_PASSWORD
 #define GATEWAY_ID                CONFIG_ECHOGUARD_GATEWAY_ID
-#define GATEWAY_FIRMWARE_VERSION  "v0.5.1"
+#define GATEWAY_FIRMWARE_VERSION  "v0.5.2"
 #define WIFI_SOFTAP_CHANNEL       6
 #define WIFI_SOFTAP_MAX_CONN      4
 
@@ -140,6 +140,9 @@ static volatile uint32_t s_lora_queue_drops;
 static volatile uint32_t s_region_rx_ok;
 static volatile uint32_t s_region_rx_invalid;
 static volatile uint32_t s_region_queue_drops;
+static volatile uint32_t s_egsync_sent;
+static volatile uint32_t s_egsync_ok;
+static volatile uint32_t s_egsync_errors;
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data);
 static void udp_keepalive_task(void *arg);
@@ -259,68 +262,76 @@ static void udp_keepalive_task(void *arg)
 
     uint32_t seq = 0;
     uint32_t warn_throttle = 0;
+    int consecutive_send_failures = 0;
 
     while (true) {
         int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
         if (sock < 0) {
-            ESP_LOGW(TAG, "UDP keepalive socket create failed: errno=%d", errno);
+            if ((warn_throttle++ % 50U) == 0U) {
+                ESP_LOGW(TAG, "UDP keepalive socket create failed: errno=%d", errno);
+            }
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
 
-        ESP_LOGI(TAG, "UDP CSI keepalive started: port=%d interval=%dms",
-                 UDP_KEEPALIVE_PORT, UDP_KEEPALIVE_INTERVAL_MS);
+        int broadcast_enabled = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enabled,
+                       sizeof(broadcast_enabled)) < 0) {
+            if ((warn_throttle++ % 50U) == 0U) {
+                ESP_LOGW(TAG, "UDP keepalive SO_BROADCAST enable failed: errno=%d", errno);
+            }
+            close(sock);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        /* SoftAP 子网广播地址在 20ms 循环外推导并缓存，避免高频路径做 DHCP/IP 查询。 */
+        struct sockaddr_in broadcast_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(UDP_KEEPALIVE_PORT),
+            .sin_addr.s_addr = htonl(INADDR_BROADCAST),
+        };
+        if (s_softap_netif != NULL) {
+            esp_netif_ip_info_t ip_info = {0};
+            if (esp_netif_get_ip_info(s_softap_netif, &ip_info) == ESP_OK) {
+                broadcast_addr.sin_addr.s_addr =
+                    ip_info.ip.addr | (uint32_t)~ip_info.netmask.addr;
+            }
+        }
+
+        esp_ip4_addr_t broadcast_ip = {.addr = broadcast_addr.sin_addr.s_addr};
+        ESP_LOGI(TAG, "UDP CSI keepalive started: port=%d interval=%dms broadcast=" IPSTR,
+                 UDP_KEEPALIVE_PORT, UDP_KEEPALIVE_INTERVAL_MS,
+                 IP2STR(&broadcast_ip));
+
+        consecutive_send_failures = 0;
 
         while (true) {
-            wifi_sta_list_t wifi_sta_list = {0};
-            esp_err_t ret = esp_wifi_ap_get_sta_list(&wifi_sta_list);
-
-            if (ret == ESP_OK && wifi_sta_list.num > 0 && s_softap_netif != NULL) {
-                esp_netif_pair_mac_ip_t mac_ip_pairs[WIFI_SOFTAP_MAX_CONN] = {0};
-                uint8_t pair_count = wifi_sta_list.num;
-                if (pair_count > WIFI_SOFTAP_MAX_CONN) {
-                    pair_count = WIFI_SOFTAP_MAX_CONN;
-                }
-
-                uint32_t cycle_seq = seq++;
-                uint8_t slot = (uint8_t)(cycle_seq % 3U) + 1U;
-                char payload[32] = {0};
-                int payload_len = snprintf(payload, sizeof(payload),
-                                           "EGSYNC:%" PRIu32 ":%u", cycle_seq, slot);
-                for (int i = 0; i < pair_count; ++i) {
-                    memcpy(mac_ip_pairs[i].mac, wifi_sta_list.sta[i].mac, sizeof(mac_ip_pairs[i].mac));
-                }
-
-                ret = esp_netif_dhcps_get_clients_by_mac(s_softap_netif, pair_count, mac_ip_pairs);
-                if (ret != ESP_OK) {
-                    if ((warn_throttle++ % 50U) == 0U) {
-                        ESP_LOGW(TAG, "UDP keepalive DHCP client lookup unavailable: %s", esp_err_to_name(ret));
-                    }
-                    vTaskDelay(pdMS_TO_TICKS(UDP_KEEPALIVE_INTERVAL_MS));
-                    continue;
-                }
-
-                for (int i = 0; i < pair_count; ++i) {
-                    uint32_t ip_addr = mac_ip_pairs[i].ip.addr;
-                    if (ip_addr == 0) {
-                        continue;
-                    }
-
-                    struct sockaddr_in dest = {
-                        .sin_family = AF_INET,
-                        .sin_port = htons(UDP_KEEPALIVE_PORT),
-                        .sin_addr.s_addr = ip_addr,
-                    };
-                    int sent = sendto(sock, payload, payload_len, 0,
-                                      (struct sockaddr *)&dest, sizeof(dest));
-                    if (sent < 0 && (warn_throttle++ % 50U) == 0U) {
-                        ESP_LOGW(TAG, "UDP keepalive send failed ip=" IPSTR " errno=%d",
-                                 IP2STR(&mac_ip_pairs[i].ip), errno);
-                    }
-                }
+            uint32_t cycle_seq = seq++;
+            uint8_t slot = (uint8_t)(cycle_seq % 3U) + 1U;
+            char payload[32] = {0};
+            int payload_len = snprintf(payload, sizeof(payload),
+                                       "EGSYNC:%" PRIu32 ":%u", cycle_seq, slot);
+            if (payload_len < 0) {
+                payload_len = 0;
             }
-            else if (ret != ESP_OK && (warn_throttle++ % 50U) == 0U) {
-                ESP_LOGW(TAG, "UDP keepalive station list unavailable: %s", esp_err_to_name(ret));
+
+            ++s_egsync_sent;
+            int sent = sendto(sock, payload, payload_len, 0,
+                              (struct sockaddr *)&broadcast_addr, sizeof(broadcast_addr));
+            if (sent < 0) {
+                ++s_egsync_errors;
+                ++consecutive_send_failures;
+                if ((warn_throttle++ % 50U) == 0U) {
+                    ESP_LOGW(TAG, "UDP keepalive broadcast send failed: errno=%d", errno);
+                }
+                if (consecutive_send_failures >= 10) {
+                    close(sock);
+                    break;
+                }
+            } else {
+                ++s_egsync_ok;
+                consecutive_send_failures = 0;
             }
 
             vTaskDelay(pdMS_TO_TICKS(UDP_KEEPALIVE_INTERVAL_MS));
@@ -552,7 +563,9 @@ static void gateway_print_status(void)
            "\"bad_length\":%" PRIu32 ",\"parse_errors\":%" PRIu32 ","
            "\"queue_drops\":%" PRIu32 ",\"queue_depth\":%u,\"wifi_clients\":%u," \
            "\"region_protocol\":%u,\"region_rx_ok\":%" PRIu32 "," \
-           "\"region_invalid\":%" PRIu32 ",\"region_queue_drops\":%" PRIu32 "}\n",
+           "\"region_invalid\":%" PRIu32 ",\"region_queue_drops\":%" PRIu32 "," \
+           "\"egsync_sent\":%" PRIu32 ",\"egsync_ok\":%" PRIu32 "," \
+           "\"egsync_errors\":%" PRIu32 "}\n",
            ECHOGUARD_PROTOCOL_VERSION,
            GATEWAY_FIRMWARE_VERSION,
            GATEWAY_ID,
@@ -568,7 +581,10 @@ static void gateway_print_status(void)
            ECHOGUARD_REGION_PROTOCOL_VERSION,
            s_region_rx_ok,
            s_region_rx_invalid,
-           s_region_queue_drops);
+           s_region_queue_drops,
+           s_egsync_sent,
+           s_egsync_ok,
+           s_egsync_errors);
     fflush(stdout);
 }
 

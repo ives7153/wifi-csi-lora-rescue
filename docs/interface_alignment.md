@@ -51,7 +51,7 @@ Gateway 每 10 秒额外输出一条状态 JSON，用于链路诊断，不会创
 {
   "type": "gateway_status",
   "protocol": 1,
-  "firmware": "v0.5.1",
+  "firmware": "v0.5.2",
   "gateway_id": "GW-01",
   "ssid": "EchoGuard-GW-01",
   "uptime_ms": 10000,
@@ -61,9 +61,22 @@ Gateway 每 10 秒额外输出一条状态 JSON，用于链路诊断，不会创
   "parse_errors": 0,
   "queue_drops": 0,
   "queue_depth": 0,
-  "wifi_clients": 3
+  "wifi_clients": 3,
+  "region_protocol": 1,
+  "region_rx_ok": 10,
+  "region_invalid": 0,
+  "region_queue_drops": 0,
+  "egsync_sent": 500,
+  "egsync_ok": 500,
+  "egsync_errors": 0
 }
 ```
+
+Gateway 每 20 ms 通过 SoftAP 子网广播（UDP 33333，启用 `SO_BROADCAST`）发送一条
+`EGSYNC` 同步帧，而不是逐客户端单播或在 20 ms 高频路径做 DHCP MAC/IP 查询。
+`egsync_sent` / `egsync_ok` / `egsync_errors` 为 Gateway v0.5.2 新增的累加计数，
+只统计广播 datagram（而非目标客户端数），仅用于链路诊断，不影响既有字段含义。
+`EGSYNC` / `EGCF` 文本与二进制格式以及区域协议版本 1 保持不变。
 
 活动 Gateway（GW-01 或 GW-02）在区域模式还会转发独立的 CSI 特征 JSON，字段结构一致，`gateway_id` 区分来源。每个 Node 帧包含本机 STA MAC 和 3 条接收链路；三节点合计覆盖 3 条 Gateway→Node 链路与 6 条有方向的 Node→Node 链路：
 
@@ -189,6 +202,7 @@ Gateway JSON 中的 `gas` 仍保持固件协议语义：MQ-135 ADC 原始值。�
 - 气体相关 UI 应显示 CO2 估算 ppm，并保留 `gas_raw` 用于诊断；校准 node1 不应改变 node2 的节点专属 R0。
 - 注入或接入两个 presence 达到用户阈值的节点后，综合研判应显示 `多节点疑似生命微动`。
 - Gateway 状态帧不得创建 `node0`，诊断报告应显示 LoRa CRC、异常长度和队列丢包计数。
+- Gateway v0.5.2 每 20 ms 通过 SoftAP 子网广播发送一条 `EGSYNC` 同步帧；`gateway_status` 应显示 `egsync_sent` / `egsync_ok` / `egsync_errors` 累加计数，高频路径不执行 DHCP MAC/IP 查询。
 - 手机覆盖、演示和回放数据必须在历史记录与 CSV 中显示正确来源。
 - 上位机只接受 GW-01/GW-02 的真实串口 `csi_features` 帧；未知 Gateway ID 显示“不支持的 Gateway”，不输出有人/无人结论。
 - 混入两个 Gateway 的区域帧不会拼成 9/9；活动 Gateway 切换后旧缓存、概率和迟滞计数自动重置。

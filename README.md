@@ -90,9 +90,9 @@ Gateway 输出一行 JSON：
 }
 ```
 
-Gateway 每 10 秒还会输出 `type=gateway_status` 状态行，包含固件版本、SSID、LoRa 正确接收数、CRC 错误数、异常长度、队列丢包和 Wi-Fi 客户端数量。状态行仅用于技术诊断，不会创建节点。
+Gateway 每 10 秒还会输出 `type=gateway_status` 状态行，包含固件版本、SSID、LoRa 正确接收数、CRC 错误数、异常长度、队列丢包、Wi-Fi 客户端数量和 EGSYNC 广播发送/成功/错误计数。状态行仅用于技术诊断，不会创建节点。
 
-区域模式下，Node 1/2/3 每 500 ms 向当前活动 Gateway（GW-01 或 GW-02）的 UDP 33334 端口上报 3 条接收链路特征。Gateway 校验 `EGCF` 魔数、协议版本、固定长度和 CRC32 后，额外输出 `type=csi_features` JSON Lines。该数据流不修改原 14 字节 LoRa 协议，也不会作为普通节点历史样本。
+Gateway 每 20 ms 通过 SoftAP 子网广播（UDP 33333，启用 `SO_BROADCAST`）发送一条 `EGSYNC` 同步帧，而不是逐客户端单播或在 20 ms 高频路径做 DHCP MAC/IP 查询。区域模式下，Node 1/2/3 每 500 ms 向当前活动 Gateway（GW-01 或 GW-02）的 UDP 33334 端口上报 3 条接收链路特征。Gateway 校验 `EGCF` 魔数、协议版本、固定长度和 CRC32 后，额外输出 `type=csi_features` JSON Lines。该数据流不修改原 14 字节 LoRa 协议，也不会作为普通节点历史样本；`EGSYNC` / `EGCF` 格式与区域协议版本 1 保持不变。
 
 上位机将字段规范化为 `node_id`、`presence_score`、`motion_score`、`confidence`、`gas_raw`、`gas_ppm`、`temperature`、`humidity`、`rssi` 等内部字段，其中 `gas` 兼容字段等同于 CO2 估算 ppm。详见 [docs/interface_alignment.md](docs/interface_alignment.md)。
 
