@@ -51,7 +51,7 @@ Gateway 每 10 秒额外输出一条状态 JSON，用于链路诊断，不会创
 {
   "type": "gateway_status",
   "protocol": 1,
-  "firmware": "v0.5.0",
+  "firmware": "v0.5.1",
   "gateway_id": "GW-01",
   "ssid": "EchoGuard-GW-01",
   "uptime_ms": 10000,

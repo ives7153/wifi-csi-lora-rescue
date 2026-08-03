@@ -39,7 +39,7 @@
 #define WIFI_SOFTAP_SSID          CONFIG_ECHOGUARD_GATEWAY_SSID
 #define WIFI_SOFTAP_PASSWORD      CONFIG_ECHOGUARD_WIFI_PASSWORD
 #define GATEWAY_ID                CONFIG_ECHOGUARD_GATEWAY_ID
-#define GATEWAY_FIRMWARE_VERSION  "v0.5.0"
+#define GATEWAY_FIRMWARE_VERSION  "v0.5.1"
 #define WIFI_SOFTAP_CHANNEL       6
 #define WIFI_SOFTAP_MAX_CONN      4
 
@@ -587,9 +587,11 @@ void app_main(void)
 {
     serial_console_init();
 #ifdef CONFIG_ECHOGUARD_OTA_ENABLED
-    ESP_LOGI(TAG, "EchoGuard Gateway v0.5.0 LoRa + triangle region bridge + LAN OTA starting");
+    ESP_LOGI(TAG, "EchoGuard Gateway %s LoRa + triangle region bridge + LAN OTA starting",
+             GATEWAY_FIRMWARE_VERSION);
 #else
-    ESP_LOGI(TAG, "EchoGuard Gateway v0.5.0 LoRa + triangle region bridge starting");
+    ESP_LOGI(TAG, "EchoGuard Gateway %s LoRa + triangle region bridge starting",
+             GATEWAY_FIRMWARE_VERSION);
 #endif
 
     nvs_init_for_wifi();

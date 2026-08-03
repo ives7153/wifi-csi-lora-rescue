@@ -178,7 +178,7 @@ OTA 令牌不会进入 Git 跟踪的源码或公开配置，但会作为认证�
 ```powershell
 cd firmware\gateway
 $env:PYTHONUTF8="1"
-idf.py -D SDKCONFIG=sdkconfig.gw01.local -B build-gw01-ota-v050 build
+idf.py -D SDKCONFIG=sdkconfig.gw01.local -B build-gw01-ota-v051 build
 ```
 
 旧版单 `factory` 分区不能直接接收 OTA。首次安装必须通过 USB/串口完整写入 Bootloader、OTA 分区表、初始 OTA 数据和应用镜像；此后电脑连接 `EchoGuard-GW-01`，在上位机“技术诊断 -> Gateway 01 OTA”中选择新的 Gateway 应用 `.bin` 即可升级。上传会校验 Gateway 工程、ESP32-S3 目标、递增版本、SHA-256 和本地令牌；新固件只有在 SoftAP、HTTP OTA 服务和 LoRa 均就绪后才取消回滚。
