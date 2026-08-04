@@ -53,14 +53,14 @@
 #define WIFI_RESELECT_DELAY_MS          2000
 #define WIFI_CONNECT_TIMEOUT_MS         12000
 #define WIFI_PRIMARY_FAILURE_LIMIT      3
-#define NODE_FIRMWARE_VERSION           "v0.5.2"
+#define NODE_FIRMWARE_VERSION           "v0.5.3"
 
 /* FreeRTOS 任务参数：本固件只创建 3 个业务任务，优先级与栈大小集中写在这里便于现场调整。 */
 #define WIFI_TASK_STACK_SIZE            6144
 #define UDP_KEEPALIVE_TASK_STACK_SIZE   4096
 #define CSI_SENSOR_TASK_STACK_SIZE      6144
 #define LORA_SEND_TASK_STACK_SIZE       4096
-#define REGION_UPLOAD_TASK_STACK_SIZE   4096
+#define REGION_UPLOAD_TASK_STACK_SIZE   8192
 #define WIFI_TASK_PRIORITY              5
 #define UDP_KEEPALIVE_TASK_PRIORITY     4
 #define CSI_SENSOR_TASK_PRIORITY        6

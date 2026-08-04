@@ -78,6 +78,11 @@ Gateway 每 20 ms 通过 SoftAP 子网广播（UDP 33333，启用 `SO_BROADCAST`
 只统计广播 datagram（而非目标客户端数），仅用于链路诊断，不影响既有字段含义。
 `EGSYNC` / `EGCF` 文本与二进制格式以及区域协议版本 1 保持不变。
 
+Node 固件 v0.5.3 修复 `region_upload` 任务栈溢出导致的确定性重启：
+`REGION_UPLOAD_TASK_STACK_SIZE` 由 4096 提升到 8192。该修复不改变区域协议、
+发送节奏、UDP 端口或双 Gateway 行为；Node 版本号独立升至 v0.5.3，
+Gateway 保持 v0.5.2、上位机保持 v0.5.1。
+
 活动 Gateway（GW-01 或 GW-02）在区域模式还会转发独立的 CSI 特征 JSON，字段结构一致，`gateway_id` 区分来源。每个 Node 帧包含本机 STA MAC 和 3 条接收链路；三节点合计覆盖 3 条 Gateway→Node 链路与 6 条有方向的 Node→Node 链路：
 
 ```json

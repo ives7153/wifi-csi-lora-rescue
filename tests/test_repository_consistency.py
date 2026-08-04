@@ -71,16 +71,16 @@ class RepositoryConsistencyTests(unittest.TestCase):
         )
         self.assertNotIn("echoguard_ota", node_sources)
 
-    def test_node_project_and_startup_versions_agree_at_0_5_2(self) -> None:
+    def test_node_project_and_startup_versions_agree_at_0_5_3(self) -> None:
         cmake = (ROOT / "firmware" / "node" / "CMakeLists.txt").read_text(encoding="utf-8")
         project_ver = re.search(r'set\(PROJECT_VER\s+"([^"]+)"\)', cmake)
         self.assertIsNotNone(project_ver, "PROJECT_VER missing in firmware/node/CMakeLists.txt")
-        self.assertEqual(project_ver.group(1), "0.5.2")
+        self.assertEqual(project_ver.group(1), "0.5.3")
 
         main_c = (ROOT / "firmware" / "node" / "main" / "main.c").read_text(encoding="utf-8")
         startup_ver = re.search(r'#define\s+NODE_FIRMWARE_VERSION\s+"v([^"]+)"', main_c)
         self.assertIsNotNone(startup_ver, "NODE_FIRMWARE_VERSION missing in firmware/node/main/main.c")
-        self.assertEqual(startup_ver.group(1), "0.5.2")
+        self.assertEqual(startup_ver.group(1), "0.5.3")
         self.assertEqual(
             startup_ver.group(1),
             project_ver.group(1),
@@ -92,7 +92,7 @@ class RepositoryConsistencyTests(unittest.TestCase):
             main_c,
         )
         self.assertEqual(
-            main_c.count("v0.5.2"),
+            main_c.count("v0.5.3"),
             1,
             "Node startup version must be reported via NODE_FIRMWARE_VERSION, not hard-coded",
         )

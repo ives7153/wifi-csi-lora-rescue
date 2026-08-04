@@ -56,17 +56,17 @@ class GatewayV052StabilityTests(unittest.TestCase):
             "Gateway CMake PROJECT_VER and runtime version disagree",
         )
 
-    def test_node_and_upper_computer_versions_unchanged(self) -> None:
+    def test_node_v053_and_upper_computer_versions(self) -> None:
         node_cmake = self._read("firmware/node/CMakeLists.txt")
         node_main = self._read("firmware/node/main/main.c")
         node_project = re.search(r'set\(PROJECT_VER\s+"([^"]+)"\)', node_cmake)
         self.assertIsNotNone(node_project)
-        self.assertEqual(node_project.group(1), "0.5.2")
+        self.assertEqual(node_project.group(1), "0.5.3")
         node_runtime = re.search(
             r'#define\s+NODE_FIRMWARE_VERSION\s+"v([^"]+)"', node_main
         )
         self.assertIsNotNone(node_runtime)
-        self.assertEqual(node_runtime.group(1), "0.5.2")
+        self.assertEqual(node_runtime.group(1), "0.5.3")
         self.assertEqual(DISPLAY_VERSION, "v0.5.1")
 
     def test_gateway_event_task_stack_size_is_4096(self) -> None:
